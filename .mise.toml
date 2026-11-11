@@ -25,7 +25,12 @@ run = [
   "go version -m bin/cli-proxy-api | head -2",
 ]
 deny_net = true
-allow_write = ["{{config_root}}", "{{env.HOME}}/.local/share/mise/installs/go"]
+allow_write = [
+  "{{config_root}}",
+  # go refreshes a stat cache next to the downloaded modules during the build.
+  "{{env.HOME}}/go/pkg/mod",
+  "{{env.HOME}}/.local/share/mise/installs/go",
+]
 
 [tasks.test]
 description = "Run the upstream test suite (offline)"
@@ -33,7 +38,12 @@ depends = ["fetch"]
 env = { GOCACHE = "{{config_root}}/.gocache", TMPDIR = "{{config_root}}/.tmp" }
 run = ["mkdir -p .tmp", "go test ./..."]
 deny_net = true
-allow_write = ["{{config_root}}", "{{env.HOME}}/.local/share/mise/installs/go"]
+allow_write = [
+  "{{config_root}}",
+  # go refreshes a stat cache next to the downloaded modules during the build.
+  "{{env.HOME}}/go/pkg/mod",
+  "{{env.HOME}}/.local/share/mise/installs/go",
+]
 
 [tasks.install]
 description = "Build and verify the binary"

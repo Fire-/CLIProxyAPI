@@ -70,8 +70,10 @@ Push to the fork after each change: `overlay/*` normally (fast-forward), and
 | `mise run clean` | Remove `bin/`, `.gocache/`, `.tmp/` |
 
 The Go toolchain is pinned by this overlay's `.mise.toml` (`go = "1.26.10"`, matching
-`go.mod`). Build tasks run sandboxed: no network, writes confined to the repo plus
-mise's Go install dir.
+`go.mod`). Build tasks run sandboxed: no network, writes confined to the repo, the module
+cache (`~/go/pkg/mod`, which `go build` stats), and mise's Go install dir. GOCACHE and
+`TMPDIR` are redirected into the repo (`.gocache/`, `.tmp/`), which upstream's `.gitignore`
+already covers.
 
 ## Runtime (~/.cli-proxy-api)
 
