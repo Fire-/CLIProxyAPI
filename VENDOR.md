@@ -101,6 +101,13 @@ re-adding the hub in T3, but prefer `tailscale serve` over binding all interface
 `/v0/management/api-call` issues arbitrary outbound requests with a pooled account's
 credentials, and one bearer key guards the whole management API.
 
+**Gotcha: `management.secret-key` is bcrypt-hashed in place on first startup.** Write the
+plaintext once; the server rewrites that line to a `$2a$…` hash and keeps only that. Clients
+send the *plaintext*, never the stored hash, so a 401 reading `invalid management key` means
+the plaintext was lost. The plaintext therefore lives in `~/.cli-proxy-api/management-key.txt`
+(mode 600, outside the repo), and that file — not `config.yaml` — is what you paste into T3.
+To rotate: overwrite the line with a new plaintext, restart, and update the stash file.
+
 ### PATH
 
 ```bash
@@ -122,7 +129,8 @@ tasks are the next overlay (`overlay/daemon`).
 
 1. Start the proxy: `mise run serve`.
 2. In T3: **Settings → Providers → Usage providers → Add hub**, URL
-   `http://127.0.0.1:8317`, management key from `~/.cli-proxy-api/config.yaml`.
+   `http://127.0.0.1:8317`, and the management key from
+   `~/.cli-proxy-api/management-key.txt`.
 3. **Usage → Limits** then lists every pooled account.
 
 T3 can also route agent traffic through the hub, but that needs a provider configured
