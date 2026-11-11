@@ -229,6 +229,10 @@ send the *plaintext*, never the stored hash, so a 401 reading `invalid managemen
 the plaintext was lost. The plaintext therefore lives in `~/.cli-proxy-api/management-key.txt`
 (mode 600, outside the repo), and that file — not `config.yaml` — is what you paste into T3.
 To rotate: overwrite the line with a new plaintext, restart, and update the stash file.
+**Move both halves together.** A mismatch answers 401, and five failed attempts ban the client
+IP for 30 minutes - with the ban checked *before* the key, so even a corrected key stays refused
+for the rest of it. The daemon asks once per revision of `config.yaml` / `management-key.txt`
+and then stops asking, rather than turning its 60s health timeout into a ban.
 
 ### PATH
 
@@ -277,10 +281,21 @@ edited directly. (t3code's VENDOR.md claims otherwise; that claim is about its o
 There is now an **idle gate**, and unlike t3's it had no counter to read: upstream has none,
 so `overlay/inflight` adds one.
 
-- `internal/api/inflight.go` counts proxy requests under `/v1` for as long as their handler
-  runs, streaming included, and reports them at `GET /v0/management/inflight` as
-  `{"inflight": n, "busy_seconds": s}` (`/v8/management/inflight` mirrors it). `mise run
-  inflight` prints it, and `daemon-status` shows it as the `serving:` line.
+- `internal/api/inflight.go` counts proxy requests for as long as their handler runs, streaming
+  included, on **every** proxy surface: the `/v1` group, the `/v1/realtime*` family (registered
+  on the engine, so wrapped route by route), `/openai/v1`, `/backend-api/codex` (Codex CLI's
+  alias for the same handlers) and `/v1beta`. Management, health, callback and root routes are
+  not counted, so the daemon's own probing never reads as work. It reports at
+  `GET /v0/management/inflight` as `{"inflight": n, "busy_seconds": s}`
+  (`/v8/management/inflight` mirrors it). `mise run inflight` prints it, and `daemon-status`
+  shows it as the `serving:` line.
+- Coverage is the part that can rot: a client on an unwrapped surface is interrupted by a
+  restart the gate believed was safe. `/v1` alone was not enough - Codex CLI talks to
+  `/backend-api/codex`, and the realtime family is registered route by route on the engine. When
+  upstream adds a route family, wrap it.
+- `/v0/management` is deprecated upstream ("do not modify ... unless necessary"), and the gauge
+  route is added there anyway: T3 and every task here already speak `/v0/management`, so the
+  tooling stays on one prefix instead of straddling both.
 - `wait_for_idle` in `scripts/daemon.sh` polls that route before every restart onto a new
   build and waits for zero, up to `CLIPROXYAPI_IDLE_TIMEOUT` (default 1800s). The gate exists
   because upstream's shutdown is **not** graceful: `api.Server.Stop` calls `http.Server.Close`
@@ -289,12 +304,23 @@ so `overlay/inflight` adds one.
   drained on SIGTERM; that was wrong, and it is why the gate is here.
 - WebSocket upgrades are excluded from the count deliberately: a session lasts as long as its
   client wants it to, so counting one would report a busy hub for hours and hold every restart
-  back to the timeout. A websocket session is still cut by a restart.
+  back to the timeout. Only a GET can upgrade (RFC 6455), so the exclusion is gated on the method
+  (`isWebsocketUpgrade`): a stray `Upgrade` header on an ordinary call still counts, because
+  under-counting is the one error that makes the gate restart onto a busy hub. A websocket
+  session is still cut by a restart.
 - An explicit `mise run daemon-stop` is **not** gated — you asked for it. Build-triggered
   restarts and adoption of a stale build wait; a crash restart does not (nothing is serving).
 - Dependency direction is `dev-infra → overlay/inflight`: the gate reads a route that overlay
-  adds. A build without it skips the wait after three unreadable polls, which is exactly the
-  behaviour this daemon had before the gate existed.
+  adds. A build without it skips the wait after three *consecutive* unreadable polls, which is exactly the
+  behaviour this daemon had before the gate existed. A **stale management key** reads the same
+  way - 401, no `inflight` field, three empty polls - so on a hub that answers 401 the gate is
+  blind even on a build that has the route. Check `management-key.txt` against `config.yaml`
+  before blaming the build.
+- The wait measures wall seconds (`$SECONDS`), not poll iterations, so a slow management
+  response cannot stretch the cap or make the log understate how long the hub was busy.
+- Upstream's `managementAvailable` 404s the **entire** management API, this route included, when
+  `home.enabled` is set - so with Home mode on the gate degrades to ungated restarts and
+  `daemon-status` loses its account count, with nothing in the log saying why. Home is off here.
 
 Logs live in the runtime dir: `daemon.log` (supervisor) and `daemon.log.server` (server stdout,
 truncated on each start). `mise run daemon-status` summarizes both, the running build, and the
@@ -320,11 +346,11 @@ Build failures in code no overlay touches are upstream's. Fix only what our over
 break; anything else gets its own small overlay, with the user's approval first.
 
 `overlay/dev-infra` adds four files and modifies no upstream source. `overlay/inflight` adds
-one (`internal/api/inflight.go`, with tests) and edits three (`internal/api/server.go` for the
-gauge field, `server_routes.go` to count the `/v1` group, and `server_management.go` /
-`server_management_v8.go` to report it). That is the whole footprint, so a failure in code no
-overlay touches is still upstream's by definition. One upstream test is a known intermittent
-failure:
+two (`internal/api/inflight.go` and `internal/api/inflight_test.go`) and edits four
+(`internal/api/server.go` for the gauge field, `server_routes.go` to wrap every proxy surface,
+and `server_management.go` / `server_management_v8.go` to report it). That is the whole
+footprint, so a failure in code no overlay touches is still upstream's by definition. One
+upstream test is a known intermittent failure:
 `TestServerResponsesWebsocketReauthorizesEachTurn` (in `internal/api`) races its own
 temp-dir cleanup and fails with `unlinkat .../auth/logs: directory not empty` under load
 while passing on its own. It fails on the clean base tag too, which is how you baseline a
@@ -338,3 +364,8 @@ git clone -q ~/vendor/cliproxyapi /tmp/baseline && cd /tmp/baseline && git check
 
 `mise run upgrade` therefore does not gate on the suite; it gates on the merges staying
 clean and the tree still compiling. Run `mise run test` by hand when you want it.
+
+A second flake in the same package, same category: `TestOAuthCallbackRouteSkipsManagementKeyMiddleware`
+passes under `-count=1` but fails the second time it runs inside one process, and the websocket
+test above fails with it, so `go test -count=2 ./internal/api/` is red on the untouched tag as
+well. The tasks run `-count=1`, which is the mode to trust.

@@ -8,10 +8,12 @@
 #   - falls back to the last binary that booted when a fresh build will not come up
 #   - re-execs itself when this script changes, adopting the live server
 #
-# Restarts wait for the hub to go idle first. Upstream's shutdown closes connections
+# Build-triggered restarts wait for the hub to go idle first; crash restarts and an explicit
+# daemon-stop do not. Upstream's shutdown closes connections
 # immediately - api.Server.Stop calls http.Server.Close, "without graceful draining" -
 # so stopping the process mid-request drops it. The wait reads the in-flight gauge from
-# overlay/inflight; on a build older than that route the wait skips itself.
+# overlay/inflight; on a build older than that route, or with a management key the server
+# rejects, the wait skips itself.
 #
 # Upstream has no build tiers to fall through, so unlike t3's daemon this one does
 # not give up: it stays up retrying the last binary it has, and picks up a fixed
@@ -59,6 +61,10 @@ active_bin="$BIN"
 last_binary_mtime=0
 crash_backoff=3
 crash_count=0
+# Set when the management API rejects the key, with the file revisions that were rejected.
+# See probes_health: asking again would earn this IP a 30-minute ban.
+auth_rejected=0
+rejected_key_sig=
 # A self-re-exec passes the baseline of the build the live server runs, so a
 # build that landed meanwhile still restarts it.
 handoff_baseline=""
@@ -180,13 +186,26 @@ adopt_server() {
 
 # ── Health ─────────────────────────────────────────────────────────────────
 probes_health() {
-	local key code
+	local key code sig
 	key=$(cat "$KEY_FILE" 2>/dev/null || true)
 	if [[ -n "$key" ]]; then
+		# A key the server rejects is not a build that failed to boot. Ask once per revision
+		# of the key file or the config, because five failed attempts ban this IP for 30
+		# minutes and the management API checks the ban before the key, so a corrected key
+		# would stay refused for the rest of it. A 60s health timeout here is 120 attempts.
+		sig="$(mtime_of "$KEY_FILE"):$(mtime_of "$CONFIG")"
+		if ((auth_rejected)) && [[ "$sig" == "$rejected_key_sig" ]]; then
+			return 1
+		fi
 		# -K - feeds curl its header on stdin. argv is world-readable through ps, and
 		# this key guards an API that can mint outbound calls with pooled credentials.
 		code=$(printf 'header = "Authorization: Bearer %s"\n' "$key" |
 			curl -s -o /dev/null -w '%{http_code}' --max-time 3 -K - "$HEALTH_URL" 2>/dev/null || true)
+		if [[ "$code" == "401" || "$code" == "403" ]]; then
+			auth_rejected=1
+			rejected_key_sig="$sig"
+			log "Management API rejected the key (HTTP $code) - $KEY_FILE does not match $CONFIG; not asking again until one of them changes"
+		fi
 		[[ "$code" == "200" ]]
 		return
 	fi
@@ -227,8 +246,11 @@ inflight_count() {
 # that cannot be asked is not waited for: the gate protects traffic that is actually
 # being served, it does not block an update on a hub that stopped answering.
 wait_for_idle() {
-	local count unknown=0 waited=0
+	local count unknown=0 started=$SECONDS waited next_log=30
 	while :; do
+		# Wall seconds, not loop iterations: curl may spend up to 3s on a slow poll, which
+		# would stretch the cap and make every log line understate the wait.
+		waited=$((SECONDS - started))
 		count=$(inflight_count)
 		if [[ -z "$count" ]]; then
 			unknown=$((unknown + 1))
@@ -245,16 +267,16 @@ wait_for_idle() {
 			unknown=0
 			if ((waited == 0)); then
 				log "Hub is serving ${count} request(s) - waiting up to ${IDLE_WAIT_TIMEOUT}s"
-			elif ((waited % 30 == 0)); then
+			elif ((waited >= next_log)); then
 				log "Still serving ${count} request(s) after ${waited}s"
+				next_log=$((waited + 30))
 			fi
 		fi
 		if ((waited >= IDLE_WAIT_TIMEOUT)); then
-			log "Waited ${IDLE_WAIT_TIMEOUT}s for an idle hub - restarting anyway"
+			log "Waited ${waited}s for an idle hub - restarting anyway"
 			return 0
 		fi
 		sleep 1
-		waited=$((waited + 1))
 	done
 }
 
