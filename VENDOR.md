@@ -29,13 +29,21 @@ v8.0.65         ← pinned release tag; the base every overlay is applied to
 └── local       ← integration branch: base tag + every overlay (merge commits ONLY)
 ```
 
-Rules mirror `~/vendor/t3code/VENDOR.md`:
+The conventions here mirror `~/vendor/t3code/VENDOR.md`, which is the most
+battle-tested of the vendored tools. `~/vendor/opencode-src` was the first one and
+its variants are older; when the two disagree, follow t3code.
+
+Rules:
 
 - **Never commit on `local`.** Merge commits only; overlays carry all real work.
 - **One concern per overlay.**
 - **Apply `overlay/dev-infra` first** in merge order (other work depends on it).
 - Overlays are independent: each is applied to the base tag, never stacked on
   another overlay. Cherry-pick shared changes, keeping the commit subject identical.
+  `mise run check-overlays` enforces both halves of that rule and runs first inside
+  `rebuild-local`.
+- **A file two overlays need moves to `overlay/dev-infra`**, removed from the others.
+  Two overlays editing the same lines conflict on every rebuild otherwise.
 - Never modify vendored upstream source for tooling reasons; config and tasks live
   in this overlay only.
 - **`local` is rebuilt, never grown.** `mise run rebuild-local` resets it to the base
@@ -44,58 +52,102 @@ Rules mirror `~/vendor/t3code/VENDOR.md`:
   overlay commit also works and produces the same tree, but it litters the history for
   no gain, which is exactly what this task exists to prevent.
 
+The base version lives in exactly one place: `CLIPROXYAPI_BASE` in `.mise.toml`
+(`[env]`), which every task reads and `mise run upgrade` rewrites.
+
 ### Base tag, not `main`
 
 We build release tags, not `origin/main`: upstream cuts several releases a day and
 tags are what users run. `local` is rebuilt as `<tag>` + overlays.
 
-### Moving the base
+### Upgrading
 
-The base is the `BASE=` line in `mise run rebuild-local`. To move it:
+Two commands, and the first one never changes anything:
 
 ```bash
-git fetch origin --tags     # bring the new release tag down
-# set BASE= in .mise.toml to the new tag, commit it on overlay/dev-infra
-mise run rebuild-local      # local := <new tag> + one merge per overlay
-mise run build
+mise run check-upstream   # read-only: newest tag, commits behind, per-overlay conflicts
+mise run upgrade          # re-overlay onto that tag, move the pin, rebuild, build
 ```
 
-When an overlay's own commits need replaying onto the new base rather than a plain
-merge, that is what `git-overlay` (`~/code/git-overlay/git-overlay`) is for, as in
-t3code. For this one small overlay, `rebuild-local` is enough.
+`mise run upgrade` does, in order: re-overlay every `overlay/*` onto the new tag
+(`sync`), rewrite `CLIPROXYAPI_BASE` and commit that on `overlay/dev-infra`, rebuild
+`local`, then build. It refuses to run from any branch but `overlay/dev-infra`, and
+refuses to start with a dirty tree. Set `CLIPROXYAPI_TARGET_TAG=v8.0.66` to move to a
+specific tag instead of the newest one.
 
-Push to the fork after each change: `overlay/*` normally (fast-forward), and
-`local` with `git push --force-with-lease fork local`.
+**Conflicts stop the run before the base moves.** A dry-run merge predicts each
+overlay first: overlays that merge cleanly are re-overlaid, conflicting ones are left
+completely untouched and listed. Resolve those by hand, one at a time:
+
+```bash
+bash ~/code/git-overlay/git-overlay v8.0.66 overlay/<name>
+# resolve the conflicts, then:
+git add <files> && bash ~/code/git-overlay/git-overlay --continue
+```
+
+Then rerun `check-upstream` until every overlay is clean, and only then `upgrade`. A
+resolution that would change what an overlay *does* is a stop-and-ask, not a merge
+decision: ask first.
+
+Push after an upgrade with the usual two commands (`overlay/*` fast-forward, `local`
+needs a lease), which `upgrade` prints when it finishes.
+
+The build stamps itself with the base tag and short commit
+(`-ldflags -X main.Version=…`), so `mise run daemon-status` reports the build the
+running server actually came from. Upstream sends that version as
+`User-Agent: CLIProxyAPI/<version>`, so it is the plain tag, never a decorated string.
+
+### Critical Git Rules
+
+Forbidden, because each one either destroys work or breaks the overlay model:
+
+- `git commit` on `local` — merge commits only
+- `git add -A` / `git add .` — stages files belonging to other overlays or agents
+- `git checkout .`, `git clean -fd` — destroys uncommitted work
+- `git stash` without checking what is stashed — may capture another agent's work
+- `git pull` on `local` — use `mise run upgrade` instead
+- `git commit --no-verify` — never bypass hooks
+- force-pushing an `overlay/*` branch — overlays only ever fast-forward
+
+If you edit the wrong branch: `git stash`, `git checkout overlay/<the-right-one>`,
+`git stash pop`, then `git add <specific files>` and commit there. `rebuild-local`
+picks the change up through the overlay.
 
 ## Mise Tasks
 
 | Task | Purpose |
 | --- | --- |
 | `mise run fetch` | `go mod download` (network open) |
-| `mise run build` | Offline build → `bin/cli-proxy-api` (`deny_net`; GOCACHE/TMPDIR confined to the repo) |
-| `mise run test` | Upstream test suite, offline |
-| `mise run update` | `install` + `build` |
-| `mise run rebuild-local` | Reset `local` to the base tag and merge each `overlay/*` once (one merge commit per overlay) |
+| `mise run build` | Offline build → `bin/cli-proxy-api` (`deny_net`; builds beside the target and moves it into place; stamps version + commit) |
+| `mise run test` | Upstream test suite (writes confined, loopback open — see below) |
+| `mise run update` | `rebuild-local` + build |
+| `mise run check-overlays` | Fail if overlays stack or a cherry-picked copy drifted |
+| `mise run check-upstream` | Read-only: newest tag, what changed, which overlays would conflict |
+| `mise run sync` | Re-overlay each `overlay/*` onto the newest tag; leaves conflicting ones untouched |
+| `mise run upgrade` | `sync` + move the base pin + `rebuild-local` + build |
+| `mise run rebuild-local` | Reset `local` to the base tag and merge each `overlay/*` once |
 | `mise run serve` | Foreground server against the runtime config |
 | `mise run tui` | Terminal management UI |
 | `mise run login-codex` / `login-codex-device` / `login-claude` / `login-antigravity` | OAuth logins; credentials land in `CLIPROXYAPI_HOME` |
 | `mise run management-key` | Fresh random management key |
 | `mise run daemon` | Start the supervisor (`scripts/daemon.sh`, detached) |
 | `mise run daemon-stop` | Stop the daemon and the proxy it supervises |
-| `mise run daemon-status` | Daemon, listener, pooled-account count at a glance |
+| `mise run daemon-status` | Daemon, listener, running build, pooled-account count |
 | `mise run daemon-log` / `server-log` / `logs` | Tail the daemon log / server log / both |
-| `mise run clean` | Remove `bin/`, `.gocache/`, `.tmp/` |
+| `mise run clean` | Remove `bin/` and `.gocache/` |
 
 The daemon tasks are deliberately **not** sandboxed: they manage a service outside the repo
 (`~/.cli-proxy-api`), and mise's deny flags would block its config, logs, and pid file.
-Everything else that runs project code is sandboxed.
+Everything else that runs project code is sandboxed, with one exception: `test` keeps its
+write confinement but **not** `deny_net`, because parts of the suite stand up `httptest`
+servers on loopback and mise's network flag is all-or-nothing (`--allow-net=<host>` is
+unsupported), so an ephemeral loopback bind fails with `operation not permitted`.
 
 The Go toolchain is pinned by this overlay's `.mise.toml` (`go = "1.26.10"`, matching
-`go.mod`). Build tasks run sandboxed: no network, writes confined to the repo, the module
+`go.mod`). The build runs sandboxed: no network, writes confined to the repo, the module
 cache (`~/go/pkg/mod`, which `go build` stats), and mise's Go install dir. `GOCACHE` and
-`TMPDIR` are redirected into the repo (`.gocache/`, `.tmp/`); upstream's `.gitignore` covers
-the first and this clone's `.git/info/exclude` covers the second, so the working tree stays
-clean.
+`TMPDIR` are both redirected under the repo (`.gocache/` and `.gocache/tmp`), which
+upstream's tracked `.gitignore` covers, so the working tree stays clean.
 
 ## Runtime (~/.cli-proxy-api)
 
@@ -103,9 +155,11 @@ Runtime state lives outside the vendor tree, so it survives `rm -rf ~/vendor/cli
 
 ```
 ~/.cli-proxy-api/
-  config.yaml   <- runtime config (gitignored; template: config.local.example.yaml)
-  auths/        <- OAuth credential JSON files, one per account
-  logs/         <- set by upstream when file logging is enabled
+  config.yaml        <- runtime config (gitignored; template: config.local.example.yaml)
+  management-key.txt <- plaintext management key, mode 600 (see the gotcha below)
+  auths/             <- OAuth credential JSON files, one per account
+  logs/              <- set by upstream when file logging is enabled
+  daemon.pid, daemon.log, daemon.log.server
 ```
 
 Config shape we use:
@@ -156,12 +210,17 @@ export PATH="$HOME/vendor/cliproxyapi/bin:$PATH"
 ### cliproxyapi:end
 ```
 
+`~/.zshrc` is a regular file on this machine, not a symlink into a dotfiles repo, so it is
+edited directly. (t3code's VENDOR.md claims otherwise; that claim is about its own machine.)
+
 ### Runner (`scripts/daemon.sh`)
 
 `mise run daemon` starts a detached supervisor that keeps the proxy answering on
 `127.0.0.1:8317` for T3's Limits panel:
 
-- restarts the server on crash, with backoff capped at 120s
+- restarts the server on crash, with backoff capped at 120s; after
+  `CLIPROXYAPI_FALLBACK_AFTER_CRASHES` (default 2) failed restarts of the current build it
+  steps aside to the fallback build instead of retrying it forever
 - restarts onto a new build when `bin/cli-proxy-api` changes (any mtime change counts, so a
   rebuild and a checkout of an older tag both land)
 - health-checks the **management API** with the stashed key, not just the port: a server that
@@ -172,14 +231,19 @@ export PATH="$HOME/vendor/cliproxyapi/bin:$PATH"
   exits; it stays up retrying.
 - re-execs itself when `scripts/daemon.sh` changes, adopting the live server
 - adopts a server on its own port that it did not start (a self-re-exec, or a manual
-  `mise run serve`), port-scoped through `lsof` so it never touches another tool's process
+  `mise run serve`), port-scoped through `lsof` so it never touches another tool's process.
+  On a self-re-exec the old instance passes its build baseline along, so a build that landed
+  meanwhile still restarts. On adoption without that baseline it compares the process start
+  time with the binary mtime, and restarts onto the current build when the binary is newer —
+  otherwise an older adopted build would latch as current and keep serving.
 
 Unlike t3 there is **no idle gate**, because the hub only serves quota reads and the server
 drains in-flight requests on SIGTERM. That changes the moment provider traffic is routed
 through the hub — add a gate before doing that.
 
 Logs live in the runtime dir: `daemon.log` (supervisor) and `daemon.log.server` (server stdout,
-truncated on each start). `mise run daemon-status` summarizes both plus the pooled-account count.
+truncated on each start). `mise run daemon-status` summarizes both, the running build, and the
+pooled-account count.
 
 Still missing: a launchd supervisor that owns this daemon's lifecycle at login, per the t3code
 plan (a supervisor which itself manages each tool's daemon).
@@ -199,3 +263,19 @@ with the hub's base URL and an `access.api-keys` entry — separate from usage r
 
 Build failures in code no overlay touches are upstream's. Fix only what our overlays
 break; anything else gets its own small overlay, with the user's approval first.
+
+This overlay adds four files and modifies no upstream source, so the whole upstream test
+suite is upstream's by definition. One test is a known intermittent failure:
+`TestServerResponsesWebsocketReauthorizesEachTurn` (in `internal/api`) races its own
+temp-dir cleanup and fails with `unlinkat .../auth/logs: directory not empty` under load
+while passing on its own. It fails on the clean base tag too, which is how you baseline a
+failure before treating it as ours:
+
+```bash
+mise exec -- go test -count=1 -run <TestName> ./path/to/pkg
+# and on the untouched tag, in a scratch clone, to compare:
+git clone -q ~/vendor/cliproxyapi /tmp/baseline && cd /tmp/baseline && git checkout <tag>
+```
+
+`mise run upgrade` therefore does not gate on the suite; it gates on the merges staying
+clean and the tree still compiling. Run `mise run test` by hand when you want it.
