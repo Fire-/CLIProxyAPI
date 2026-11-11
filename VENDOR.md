@@ -38,19 +38,31 @@ Rules mirror `~/vendor/t3code/VENDOR.md`:
   another overlay. Cherry-pick shared changes, keeping the commit subject identical.
 - Never modify vendored upstream source for tooling reasons; config and tasks live
   in this overlay only.
+- **`local` is rebuilt, never grown.** `mise run rebuild-local` resets it to the base
+  tag and merges each `overlay/*` branch once, so it carries **one merge commit per
+  overlay branch** — not one per overlay commit. Merging `local` after every single
+  overlay commit also works and produces the same tree, but it litters the history for
+  no gain, which is exactly what this task exists to prevent.
 
 ### Base tag, not `main`
 
 We build release tags, not `origin/main`: upstream cuts several releases a day and
-tags are what users run. `local` is rebuilt as `v<tag>` + overlays.
+tags are what users run. `local` is rebuilt as `<tag>` + overlays.
 
-### Sync
+### Moving the base
+
+The base is the `BASE=` line in `mise run rebuild-local`. To move it:
 
 ```bash
-git fetch origin --tags
-# move the base: create the new base branch on the tag, then re-apply overlays
-bash ~/code/git-overlay/git-overlay v8.0.66 overlay/dev-infra
+git fetch origin --tags     # bring the new release tag down
+# set BASE= in .mise.toml to the new tag, commit it on overlay/dev-infra
+mise run rebuild-local      # local := <new tag> + one merge per overlay
+mise run build
 ```
+
+When an overlay's own commits need replaying onto the new base rather than a plain
+merge, that is what `git-overlay` (`~/code/git-overlay/git-overlay`) is for, as in
+t3code. For this one small overlay, `rebuild-local` is enough.
 
 Push to the fork after each change: `overlay/*` normally (fast-forward), and
 `local` with `git push --force-with-lease fork local`.
@@ -63,6 +75,7 @@ Push to the fork after each change: `overlay/*` normally (fast-forward), and
 | `mise run build` | Offline build → `bin/cli-proxy-api` (`deny_net`; GOCACHE/TMPDIR confined to the repo) |
 | `mise run test` | Upstream test suite, offline |
 | `mise run update` | `install` + `build` |
+| `mise run rebuild-local` | Reset `local` to the base tag and merge each `overlay/*` once (one merge commit per overlay) |
 | `mise run serve` | Foreground server against the runtime config |
 | `mise run tui` | Terminal management UI |
 | `mise run login-codex` / `login-codex-device` / `login-claude` / `login-antigravity` | OAuth logins; credentials land in `CLIPROXYAPI_HOME` |
