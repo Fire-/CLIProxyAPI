@@ -79,9 +79,10 @@ Everything else that runs project code is sandboxed.
 
 The Go toolchain is pinned by this overlay's `.mise.toml` (`go = "1.26.10"`, matching
 `go.mod`). Build tasks run sandboxed: no network, writes confined to the repo, the module
-cache (`~/go/pkg/mod`, which `go build` stats), and mise's Go install dir. GOCACHE and
-`TMPDIR` are redirected into the repo (`.gocache/`, `.tmp/`), which upstream's `.gitignore`
-already covers.
+cache (`~/go/pkg/mod`, which `go build` stats), and mise's Go install dir. `GOCACHE` and
+`TMPDIR` are redirected into the repo (`.gocache/`, `.tmp/`); upstream's `.gitignore` covers
+the first and this clone's `.git/info/exclude` covers the second, so the working tree stays
+clean.
 
 ## Runtime (~/.cli-proxy-api)
 
