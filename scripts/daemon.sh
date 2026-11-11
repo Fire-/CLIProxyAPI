@@ -8,9 +8,10 @@
 #   - falls back to the last binary that booted when a fresh build will not come up
 #   - re-execs itself when this script changes, adopting the live server
 #
-# No idle gate: the hub serves quota reads, and the server drains in-flight
-# requests on SIGTERM (internal/api/mux_listener.go), so a swap does not cut a
-# request off. Revisit this if provider traffic is routed through the hub.
+# Restarts wait for the hub to go idle first. Upstream's shutdown closes connections
+# immediately - api.Server.Stop calls http.Server.Close, "without graceful draining" -
+# so stopping the process mid-request drops it. The wait reads the in-flight gauge from
+# overlay/inflight; on a build older than that route the wait skips itself.
 #
 # Upstream has no build tiers to fall through, so unlike t3's daemon this one does
 # not give up: it stays up retrying the last binary it has, and picks up a fixed
@@ -39,8 +40,13 @@ PROBE_HOST="127.0.0.1"
 # Probe the management API, not just the port: that is the surface T3 reads, and a
 # server that serves /v1/models while 401ing management is useless for Limits.
 HEALTH_URL="http://$PROBE_HOST:$PORT/v0/management/auth-files"
+# What the idle gate polls before stopping a hub that is still serving. See wait_for_idle.
+INFLIGHT_URL="http://$PROBE_HOST:$PORT/v0/management/inflight"
 BIN_CHECK_INTERVAL="${CLIPROXYAPI_BIN_CHECK_INTERVAL:-30}"
 HEALTH_TIMEOUT="${CLIPROXYAPI_HEALTH_TIMEOUT:-60}"
+# How long a restart waits for in-flight requests to finish. A streaming turn runs for
+# minutes, so the default is generous; an explicit `mise run daemon-stop` is not gated.
+IDLE_WAIT_TIMEOUT="${CLIPROXYAPI_IDLE_TIMEOUT:-1800}"
 # Consecutive failed restarts of the current build before the daemon steps aside and
 # serves the fallback build instead (see the crash-recovery branch in the main loop).
 FALLBACK_AFTER_CRASHES="${CLIPROXYAPI_FALLBACK_AFTER_CRASHES:-2}"
@@ -204,6 +210,54 @@ health_check() {
 	return 1
 }
 
+# ── Idle gate ──────────────────────────────────────────────────────────────
+# Prints how many requests the hub is serving right now, or nothing when that cannot be
+# established: no management key, a build older than the gauge route, or a server that
+# is not answering.
+inflight_count() {
+	local key body
+	key=$(cat "$KEY_FILE" 2>/dev/null || true)
+	[[ -n "$key" ]] || return 0
+	body=$(printf 'header = "Authorization: Bearer %s"\n' "$key" |
+		curl -s --max-time 3 -K - "$INFLIGHT_URL" 2>/dev/null || true)
+	printf '%s' "$body" | sed -n 's/.*"inflight":\([0-9][0-9]*\).*/\1/p'
+}
+
+# Wait for the hub to finish what it is serving before the caller restarts it. A hub
+# that cannot be asked is not waited for: the gate protects traffic that is actually
+# being served, it does not block an update on a hub that stopped answering.
+wait_for_idle() {
+	local count unknown=0 waited=0
+	while :; do
+		count=$(inflight_count)
+		if [[ -z "$count" ]]; then
+			unknown=$((unknown + 1))
+			if ((unknown >= 3)); then
+				log "Hub does not report in-flight requests - restarting without waiting"
+				return 0
+			fi
+		elif ((count == 0)); then
+			if ((waited > 0)); then
+				log "Hub is idle after ${waited}s - restarting"
+			fi
+			return 0
+		else
+			unknown=0
+			if ((waited == 0)); then
+				log "Hub is serving ${count} request(s) - waiting up to ${IDLE_WAIT_TIMEOUT}s"
+			elif ((waited % 30 == 0)); then
+				log "Still serving ${count} request(s) after ${waited}s"
+			fi
+		fi
+		if ((waited >= IDLE_WAIT_TIMEOUT)); then
+			log "Waited ${IDLE_WAIT_TIMEOUT}s for an idle hub - restarting anyway"
+			return 0
+		fi
+		sleep 1
+		waited=$((waited + 1))
+	done
+}
+
 # Keep the binary that just proved healthy. mktemp, so a pre-planted symlink at a
 # predictable name cannot redirect the copy over something else.
 snapshot_bak() {
@@ -235,6 +289,10 @@ trim_logs() {
 # Restart onto the current build, falling back to the last known-good binary when
 # the new one will not answer. Returns 0 when some binary is serving.
 restart_onto_build() {
+	# Nothing to wait for when no server is running: that is the crash-recovery path.
+	if [[ -n "${server_pid:-}" ]] && kill -0 "$server_pid" 2>/dev/null; then
+		wait_for_idle
+	fi
 	stop_server
 	log "Restarting onto $BIN (mtime $(binary_mtime))"
 	last_binary_mtime=$(binary_mtime)

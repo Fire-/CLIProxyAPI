@@ -529,6 +529,14 @@ if [[ -n "$key" ]]; then
   else
     echo "hub: management API not answering"
   fi
+  # What the daemon's idle gate reads before it restarts onto a new build.
+  gauge=$(printf 'header = "Authorization: Bearer %s"\n' "$key" |
+    curl -sf --max-time 3 -K - "http://127.0.0.1:$PORT/v0/management/inflight" 2>/dev/null || true)
+  if [[ -n "$gauge" ]]; then
+    inflight=$(printf '%s' "$gauge" | sed -n 's/.*"inflight":\([0-9][0-9]*\).*/\1/p')
+    busy=$(printf '%s' "$gauge" | sed -n 's/.*"busy_seconds":\([0-9][0-9]*\).*/\1/p')
+    echo "serving: ${inflight:-?} request(s) (busy ${busy:-?}s)"
+  fi
 else
   echo "hub: no management key at $RUNTIME/management-key.txt"
 fi
@@ -540,6 +548,22 @@ fi
 [tasks.daemon-log]
 description = "Tail the daemon log"
 run = 'tail -f "${CLIPROXYAPI_HOME:-$HOME/.cli-proxy-api}/daemon.log"'
+
+[tasks.inflight]
+description = "Requests the hub is serving right now (what the daemon's idle gate reads)"
+run = '''
+RUNTIME="${CLIPROXYAPI_HOME:-$HOME/.cli-proxy-api}"
+PORT="${CLIPROXYAPI_PORT:-8317}"
+key=$(cat "$RUNTIME/management-key.txt" 2>/dev/null || true)
+if [[ -z "$key" ]]; then
+  echo "No management key at $RUNTIME/management-key.txt"
+  exit 1
+fi
+# -K - keeps the key out of argv, where any local process can read it from ps.
+printf 'header = "Authorization: Bearer %s"\n' "$key" |
+  curl -s --max-time 3 -K - "http://127.0.0.1:$PORT/v0/management/inflight" || true
+echo
+'''
 
 [tasks.server-log]
 description = "Tail the proxy server log"
