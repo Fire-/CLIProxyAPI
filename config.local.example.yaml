@@ -8,7 +8,11 @@ server:
   port: 8317
 
 management:
-  # Config-file only; cannot be changed through the management API.
+  # Not config-file only: anyone holding secret-key can rewrite this whole file through
+  # PUT /v0/management/config.yaml, which persists it and reloads it live, so the key can
+  # turn remote management on by itself. Keep this false and the hub loopback-only;
+  # VENDOR.md ("Runtime") has the full reasoning, including why /v0/management/api-call
+  # makes an exposed key worse than it looks.
   allow-remote: false
   # Required. Without it every /v0/management route returns 404.
   # Generate with: mise run management-key

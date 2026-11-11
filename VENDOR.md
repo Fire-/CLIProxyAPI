@@ -37,11 +37,17 @@ Rules:
 
 - **Never commit on `local`.** Merge commits only; overlays carry all real work.
 - **One concern per overlay.**
-- **Apply `overlay/dev-infra` first** in merge order (other work depends on it).
+- **`overlay/dev-infra` merges first** (other work depends on the tasks and config it
+  carries). `rebuild-local` merges it ahead of the rest, which otherwise go in name order.
 - Overlays are independent: each is applied to the base tag, never stacked on
   another overlay. Cherry-pick shared changes, keeping the commit subject identical.
-  `mise run check-overlays` enforces both halves of that rule and runs first inside
-  `rebuild-local`.
+  `mise run check-overlays` enforces that, and that every overlay still sits on the
+  pinned base, and it runs first inside `rebuild-local`.
+- **`sync` re-overlays; it never moves the pin.** Run standalone, it leaves the overlays
+  on the new tag while `CLIPROXYAPI_BASE` still names the old one, and the next
+  `rebuild-local` stops with `<branch> is based on …, but the pin is …`. Move the pin
+  with `mise run upgrade` (which does both) before rebuilding: building in that state
+  would stamp the old tag onto newer code.
 - **A file two overlays need moves to `overlay/dev-infra`**, removed from the others.
   Two overlays editing the same lines conflict on every rebuild otherwise.
 - Never modify vendored upstream source for tooling reasons; config and tasks live
@@ -67,10 +73,10 @@ tags are what users run. `local` is rebuilt as `<tag>` + overlays.
 
 ### Upgrading
 
-Two commands, and the first one never changes anything:
+Two commands, and the first one moves no branch:
 
 ```bash
-mise run check-upstream   # read-only: newest tag, commits behind, per-overlay conflicts
+mise run check-upstream   # tags only: newest tag, commits behind, per-overlay conflicts
 mise run upgrade          # re-overlay onto that tag, move the pin, rebuild, build
 ```
 
@@ -79,6 +85,13 @@ mise run upgrade          # re-overlay onto that tag, move the pin, rebuild, bui
 `local`, then build. It refuses to run from any branch but `overlay/dev-infra`, and
 refuses to start with a dirty tree. Set `CLIPROXYAPI_TARGET_TAG=v8.0.66` to move to a
 specific tag instead of the newest one.
+
+The tag it resolved is handed to `sync` rather than looked up again, so a release cut
+between the two fetches cannot leave the pin and the overlays on different tags. The pin
+itself is rewritten through a temp file and `mv`: `sed -i ''` is BSD-only, and on GNU sed
+that empty suffix becomes the script and the `s`-command becomes a filename, which used to
+kill `upgrade` mid-run with every overlay already re-overlaid onto the new tag. That state
+is exactly what `check-overlays` refuses to rebuild, so the two bugs used to compound.
 
 **Conflicts stop the run before the base moves.** A dry-run merge predicts each
 overlay first: overlays that merge cleanly are re-overlaid, conflicting ones are left
@@ -94,8 +107,15 @@ Then rerun `check-upstream` until every overlay is clean, and only then `upgrade
 resolution that would change what an overlay *does* is a stop-and-ask, not a merge
 decision: ask first.
 
-Push after an upgrade with the usual two commands (`overlay/*` fast-forward, `local`
-needs a lease), which `upgrade` prints when it finishes.
+If `sync` dies inside git-overlay rather than on its dry run, check for its leftovers
+before rerunning: `git-overlay-pre-merge-<name>` (a parked pre-merge branch, only left
+behind if git-overlay itself failed between its two renames) and
+`overlay/<name>-overlayed-on-top-of-<tag>` (its staging branch). `sync` deletes the staging
+branch itself, so a leftover one means the failure happened before that cleanup ran.
+
+Push after an upgrade with the commands `upgrade` prints when it finishes: one
+`git push fork overlay/<name>` per overlay, because `sync` moves all of them, plus
+`git push --force-with-lease fork local` (overlays fast-forward; `local` needs a lease).
 
 The build stamps itself with the base tag and short commit
 (`-ldflags -X main.Version=…`), so `mise run daemon-status` reports the build the
@@ -126,9 +146,9 @@ picks the change up through the overlay.
 | `mise run build` | Offline build → `bin/cli-proxy-api` (`deny_net`; builds beside the target and moves it into place; stamps version + commit) |
 | `mise run test` | Upstream test suite (writes confined, loopback open — see below) |
 | `mise run update` | `rebuild-local` + build |
-| `mise run check-overlays` | Fail if overlays stack or a cherry-picked copy drifted |
-| `mise run check-upstream` | Read-only: newest tag, what changed, which overlays would conflict |
-| `mise run sync` | Re-overlay each `overlay/*` onto the newest tag; leaves conflicting ones untouched |
+| `mise run check-overlays` | Fail if an overlay sits off the pinned base, stacks, or has a drifted cherry-pick |
+| `mise run check-upstream` | Newest tag, what changed, which overlays would conflict (fetches tags, moves no branch) |
+| `mise run sync` | Re-overlay each `overlay/*` onto the newest tag; leaves conflicting ones untouched; the pin does **not** move |
 | `mise run upgrade` | `sync` + move the base pin + `rebuild-local` + build |
 | `mise run rebuild-local` | Reset `local` to the base tag and merge each `overlay/*` once |
 | `mise run serve` | Foreground server against the runtime config |
@@ -184,6 +204,8 @@ the auth middleware reads `allow-remote` from that live config per request. So t
 turn remote management on by itself — on top of `/v0/management/api-call` issuing arbitrary
 outbound requests with a pooled account's credentials. Keep the hub loopback-only; if you
 ever need remote access, prefer `tailscale serve` over binding all interfaces.
+`config.local.example.yaml` carries the same warning, because that template is what a new
+`config.yaml` gets built from — keep the two in step.
 
 Security-relevant behavior of the daemon and its tasks, recorded so an edit does not quietly
 undo it:
@@ -240,7 +262,13 @@ edited directly. (t3code's VENDOR.md claims otherwise; that claim is about its o
   On a self-re-exec the old instance passes its build baseline along, so a build that landed
   meanwhile still restarts. On adoption without that baseline it compares the process start
   time with the binary mtime, and restarts onto the current build when the binary is newer —
-  otherwise an older adopted build would latch as current and keep serving.
+  otherwise an older adopted build would latch as current and keep serving. That comparison
+  parses `ps` lstart with BSD `date -j -f` and falls back to GNU `date -d`; a time neither
+  can parse degrades to "ageless", which skips the restart rather than forcing one.
+- `mise run daemon` treats a recycled PID in the PID file as stale rather than as an
+  already-running daemon, so a stale file no longer blocks a start until `daemon-stop` clears it.
+- `daemon-stop` also stops an orphaned proxy: a daemon that has to be SIGKILLed never runs the
+  cleanup that stops its server, so the task name-checks the listener on the port and kills it.
 
 Unlike t3 there is **no idle gate**, because the hub only serves quota reads and the server
 drains in-flight requests on SIGTERM. That changes the moment provider traffic is routed
