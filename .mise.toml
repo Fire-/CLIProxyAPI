@@ -1,0 +1,76 @@
+# Toolchain, build, and run tasks for our vendored CLIProxyAPI clone.
+# Tracked on overlay/dev-infra (see VENDOR.md). Base is the latest upstream release tag.
+# Upgrade: git fetch origin --tags, move the base tag in `mise run retag`/VENDOR.md, then `mise run update`.
+
+[tools]
+# Matches the `go` directive in go.mod; mise keeps the toolchain out of the repo.
+go = "1.26.10"
+
+[env]
+# Runtime state (config.yaml, auths/, logs/) lives outside the vendor tree.
+CLIPROXYAPI_HOME = "{{env.HOME}}/.cli-proxy-api"
+_.path = ["{{config_root}}/bin"]
+
+[tasks.fetch]
+description = "Download module sources (network open)"
+run = "go mod download"
+
+[tasks.build]
+description = "Offline release build; binary lands in bin/cli-proxy-api"
+depends = ["fetch"]
+env = { GOCACHE = "{{config_root}}/.gocache", TMPDIR = "{{config_root}}/.tmp" }
+run = [
+  "mkdir -p bin .tmp",
+  "go build -o bin/cli-proxy-api ./cmd/server",
+  "go version -m bin/cli-proxy-api | head -2",
+]
+deny_net = true
+allow_write = ["{{config_root}}", "{{env.HOME}}/.local/share/mise/installs/go"]
+
+[tasks.test]
+description = "Run the upstream test suite (offline)"
+depends = ["fetch"]
+env = { GOCACHE = "{{config_root}}/.gocache", TMPDIR = "{{config_root}}/.tmp" }
+run = ["mkdir -p .tmp", "go test ./..."]
+deny_net = true
+allow_write = ["{{config_root}}", "{{env.HOME}}/.local/share/mise/installs/go"]
+
+[tasks.install]
+description = "Build and verify the binary"
+run = "mise run build"
+
+[tasks.serve]
+description = "Run the proxy in the foreground against the runtime config"
+run = "bin/cli-proxy-api --config {{env.CLIPROXYAPI_HOME}}/config.yaml"
+
+[tasks.login-codex]
+description = "OAuth login for a ChatGPT/Codex account (writes into CLIPROXYAPI_HOME)"
+run = "bin/cli-proxy-api --codex-login --config {{env.CLIPROXYAPI_HOME}}/config.yaml"
+
+[tasks.login-codex-device]
+description = "OAuth login for ChatGPT/Codex via device-code flow (no local callback)"
+run = "bin/cli-proxy-api --codex-device-login --config {{env.CLIPROXYAPI_HOME}}/config.yaml"
+
+[tasks.login-claude]
+description = "OAuth login for a Claude Code account"
+run = "bin/cli-proxy-api --claude-login --config {{env.CLIPROXYAPI_HOME}}/config.yaml"
+
+[tasks.login-antigravity]
+description = "OAuth login for a Google Antigravity/Gemini account"
+run = "bin/cli-proxy-api --antigravity-login --config {{env.CLIPROXYAPI_HOME}}/config.yaml"
+
+[tasks.tui]
+description = "Terminal management UI against the runtime config"
+run = "bin/cli-proxy-api --tui --config {{env.CLIPROXYAPI_HOME}}/config.yaml"
+
+[tasks.management-key]
+description = "Generate a fresh management key for the runtime config"
+run = "openssl rand -base64 32"
+
+[tasks.update]
+description = "install + build"
+run = "mise run install && mise run build"
+
+[tasks.clean]
+description = "Remove build outputs and the local Go build cache"
+run = ["rm -rf bin .gocache .tmp"]
