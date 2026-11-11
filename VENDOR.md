@@ -51,6 +51,11 @@ Rules:
   overlay branch** — not one per overlay commit. Merging `local` after every single
   overlay commit also works and produces the same tree, but it litters the history for
   no gain, which is exactly what this task exists to prevent.
+- **`rebuild-local` leaves you on `local`**, by design, and it starts with
+  `git reset --hard`. Switch back before editing anything (`git branch --show-current`),
+  because a topic commit made on `local` is discarded by the next rebuild. If that
+  already happened it is recoverable: `git reflog | rg 'commit:'` finds the orphan, and
+  `git cherry-pick <sha>` on the overlay branch puts it back.
 
 The base version lives in exactly one place: `CLIPROXYAPI_BASE` in `.mise.toml`
 (`[env]`), which every task reads and `mise run upgrade` rewrites.

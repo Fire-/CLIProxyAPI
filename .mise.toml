@@ -333,6 +333,10 @@ for b in $(git branch --list 'overlay/*' --format='%(refname:short)' | sort); do
 done
 echo "local rebuilt on $BASE:"
 git log --oneline --graph -3
+echo
+echo "NOTE: you are on local now. Merge commits belong on local, topic commits do not,"
+echo "so switch back before editing: git checkout overlay/<name>"
+echo "(a commit made here is discarded by the next rebuild-local.)"
 '''
 
 [tasks.clean]
