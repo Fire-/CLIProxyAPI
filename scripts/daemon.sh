@@ -40,7 +40,9 @@ PROBE_HOST="127.0.0.1"
 HEALTH_URL="http://$PROBE_HOST:$PORT/v0/management/auth-files"
 BIN_CHECK_INTERVAL="${CLIPROXYAPI_BIN_CHECK_INTERVAL:-30}"
 HEALTH_TIMEOUT="${CLIPROXYAPI_HEALTH_TIMEOUT:-60}"
-MAX_CRASH_RETRIES="${CLIPROXYAPI_MAX_CRASH_RETRIES:-5}"
+# Consecutive failed restarts of the current build before the daemon steps aside and
+# serves the fallback build instead (see the crash-recovery branch in the main loop).
+FALLBACK_AFTER_CRASHES="${CLIPROXYAPI_FALLBACK_AFTER_CRASHES:-2}"
 LOG_MAX_BYTES="${CLIPROXYAPI_LOG_MAX_BYTES:-$((8 * 1024 * 1024))}"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
@@ -85,6 +87,25 @@ binary_changed() {
 	local mtime
 	mtime=$(binary_mtime)
 	[[ "$mtime" -gt 0 && "$mtime" -ne "$last_binary_mtime" ]]
+}
+
+# When the process started, in epoch seconds, or 0 when ps cannot say. Adoption
+# compares it with the binary mtime: a build that landed after the process started
+# means the live server is running older code than what is on disk.
+process_start_epoch() {
+	local pid="${1:-}" started
+	[[ -n "$pid" ]] || { echo 0; return; }
+	started=$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//; s/ *$//')
+	[[ -n "$started" ]] || { echo 0; return; }
+	date -j -f "%a %b %d %T %Y" "$started" "+%s" 2>/dev/null || echo 0
+}
+
+# True when bin/cli-proxy-api is newer than the given epoch. 0 means ps could not
+# tell us when the process started, and an unknown age is not a reason to restart.
+build_is_newer_than() {
+	local epoch="${1:-0}"
+	[[ "$epoch" =~ ^[0-9]+$ && "$epoch" -gt 0 ]] || return 1
+	[[ "$(binary_mtime)" -gt "$epoch" ]]
 }
 
 # A PID from a file or a port lookup can be recycled. Fails open when ps tells us
@@ -166,7 +187,11 @@ health_check() {
 	local started=$SECONDS
 	while ((SECONDS - started < HEALTH_TIMEOUT)); do
 		probes_health && return 0
-		kill -0 "${server_pid:-0}" 2>/dev/null || return 1
+		# An empty PID is not a live process: `kill -0 0` would signal our own
+		# process group and always succeed, burning the full timeout instead.
+		if [[ -z "$server_pid" ]] || ! kill -0 "$server_pid" 2>/dev/null; then
+			return 1
+		fi
 		sleep 1
 	done
 	return 1
@@ -273,12 +298,22 @@ last_binary_mtime=$(binary_mtime)
 
 if adopt_server; then
 	log "Adopted the server on port $PORT (PID $server_pid)"
+	stale_build=0
 	if [[ -n "$handoff_baseline" ]]; then
 		# Self-re-exec: the previous instance knows which build this server runs,
 		# so a build that landed meanwhile still restarts it.
 		last_binary_mtime="$handoff_baseline"
+	elif build_is_newer_than "$(process_start_epoch "$server_pid")"; then
+		# A server we did not start (a manual `mise run serve`) can be running older
+		# code. Adopting it as-is would latch that older build as current, and it would
+		# keep serving until bin/ changed again. The process start time is the only
+		# thing that says which build is live.
+		log "Adopted server started before the current build - restarting onto $BIN"
+		stale_build=1
 	fi
-	if probes_health; then
+	if ((stale_build)); then
+		restart_onto_build || log "CRITICAL: no healthy build"
+	elif probes_health; then
 		log "Adopted server is healthy"
 	else
 		log "Adopted server is not answering the management API"
@@ -314,7 +349,7 @@ while true; do
 			log "Restart failed its health check"
 			stop_server
 			# A broken current build steps aside once; a broken fallback keeps retrying.
-			if [[ "$active_bin" == "$BIN" && -x "$BAK" && $crash_count -ge 2 ]]; then
+			if [[ "$active_bin" == "$BIN" && -x "$BAK" && $crash_count -ge $FALLBACK_AFTER_CRASHES ]]; then
 				log "Switching to the last healthy build ($BAK) until the current build changes"
 				active_bin="$BAK"
 				crash_count=0
