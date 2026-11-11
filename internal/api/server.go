@@ -105,6 +105,10 @@ type Server struct {
 	keepAliveHeartbeat chan struct{}
 	keepAliveStop      chan struct{}
 
+	// inflight counts the proxy requests being served right now, so an outside
+	// supervisor can restart an idle hub only. See inflight.go.
+	inflight inflightGauge
+
 	exampleAPIKeySafeModeEnabled bool
 	exampleAPIKeySafeModeActive  atomic.Bool
 }
