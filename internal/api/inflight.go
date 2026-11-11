@@ -2,11 +2,11 @@ package api
 
 import (
 	"net/http"
-	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 )
 
 // inflightGauge counts the proxy requests a server is serving right now, so a
@@ -58,10 +58,12 @@ func (g *inflightGauge) snapshot() (active int64, busySeconds int64) {
 	return active, 0
 }
 
-// middleware counts the requests of the group it is attached to.
+// middleware counts every request on the routes it is installed on. Install it on each
+// proxy surface (see server_routes.go); management, health and callback routes stay
+// uncounted, so a supervisor's own probing is not mistaken for work.
 func (g *inflightGauge) middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if strings.EqualFold(c.GetHeader("Upgrade"), "websocket") {
+		if isWebsocketUpgrade(c) {
 			c.Next()
 			return
 		}
@@ -69,6 +71,20 @@ func (g *inflightGauge) middleware() gin.HandlerFunc {
 		defer g.leave()
 		c.Next()
 	}
+}
+
+// isWebsocketUpgrade reports whether the request is a websocket handshake. Upgrading
+// requires a GET (RFC 6455) - gorilla answers every other method with 405 - so a POST that
+// carries the headers is still counted: skipping it on the headers alone would let the gauge
+// report an idle hub with that call mid-flight, the one mistake the gate exists to prevent.
+// The header test is gorilla's own, which compares tokens rather than whole values, so
+// `Upgrade: websocket, h2c` is excluded too. Counting that session would pin the gauge above
+// zero for as long as the client holds it, and every restart would wait out its cap.
+func isWebsocketUpgrade(c *gin.Context) bool {
+	if c.Request.Method != http.MethodGet {
+		return false
+	}
+	return websocket.IsWebSocketUpgrade(c.Request)
 }
 
 // handleInflight reports the gauge over the management API. It is registered inline

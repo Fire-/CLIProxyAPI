@@ -94,25 +94,28 @@ func (s *Server) setupRoutes() {
 		v1.GET("/live/:call_id", s.codexLiveHandler.HandleSideband)
 	}
 
+	// The realtime family is registered on the engine rather than in a group, so each
+	// route is wrapped for the gauge individually. The websocket-capable GETs are wrapped
+	// too: the middleware skips upgrades itself, so the rule stays in one place.
 	realtimeAuth := realtimeAuthMiddleware(s.accessManager, s.codexLiveHandler)
 	standardAuth := realtimeStandardAuthMiddleware(s.accessManager)
-	s.engine.GET("/v1/realtime", realtimeAuth, s.codexLiveHandler.HandleRealtimeWebsocket)
-	s.engine.POST("/v1/realtime", realtimeAuth, s.codexLiveHandler.Handle)
-	s.engine.POST("/v1/realtime/calls", realtimeAuth, s.codexLiveHandler.Handle)
-	s.engine.GET("/v1/realtime/calls/:call_id", realtimeAuth, s.codexLiveHandler.HandleSideband)
-	s.engine.POST("/v1/realtime/client_secrets", standardAuth, s.codexLiveHandler.CreateClientSecret)
-	s.engine.POST("/v1/realtime/sessions", standardAuth, s.codexLiveHandler.CreateLegacySession)
-	s.engine.POST("/v1/realtime/transcription_sessions", standardAuth, s.codexLiveHandler.HandleTranscriptionSession)
-	s.engine.GET("/v1/realtime/translations", realtimeAuth, s.codexLiveHandler.HandleTranslation)
-	s.engine.POST("/v1/realtime/translations", realtimeAuth, s.codexLiveHandler.HandleTranslation)
-	s.engine.POST("/v1/realtime/translations/client_secrets", standardAuth, s.codexLiveHandler.HandleTranslation)
-	s.engine.POST("/v1/realtime/calls/:call_id/hangup", standardAuth, s.codexLiveHandler.HandleHangup)
-	s.engine.POST("/v1/realtime/calls/:call_id/accept", standardAuth, s.codexLiveHandler.HandleSIPControl)
-	s.engine.POST("/v1/realtime/calls/:call_id/reject", standardAuth, s.codexLiveHandler.HandleSIPControl)
-	s.engine.POST("/v1/realtime/calls/:call_id/refer", standardAuth, s.codexLiveHandler.HandleSIPControl)
+	s.engine.GET("/v1/realtime", s.inflight.middleware(), realtimeAuth, s.codexLiveHandler.HandleRealtimeWebsocket)
+	s.engine.POST("/v1/realtime", s.inflight.middleware(), realtimeAuth, s.codexLiveHandler.Handle)
+	s.engine.POST("/v1/realtime/calls", s.inflight.middleware(), realtimeAuth, s.codexLiveHandler.Handle)
+	s.engine.GET("/v1/realtime/calls/:call_id", s.inflight.middleware(), realtimeAuth, s.codexLiveHandler.HandleSideband)
+	s.engine.POST("/v1/realtime/client_secrets", s.inflight.middleware(), standardAuth, s.codexLiveHandler.CreateClientSecret)
+	s.engine.POST("/v1/realtime/sessions", s.inflight.middleware(), standardAuth, s.codexLiveHandler.CreateLegacySession)
+	s.engine.POST("/v1/realtime/transcription_sessions", s.inflight.middleware(), standardAuth, s.codexLiveHandler.HandleTranscriptionSession)
+	s.engine.GET("/v1/realtime/translations", s.inflight.middleware(), realtimeAuth, s.codexLiveHandler.HandleTranslation)
+	s.engine.POST("/v1/realtime/translations", s.inflight.middleware(), realtimeAuth, s.codexLiveHandler.HandleTranslation)
+	s.engine.POST("/v1/realtime/translations/client_secrets", s.inflight.middleware(), standardAuth, s.codexLiveHandler.HandleTranslation)
+	s.engine.POST("/v1/realtime/calls/:call_id/hangup", s.inflight.middleware(), standardAuth, s.codexLiveHandler.HandleHangup)
+	s.engine.POST("/v1/realtime/calls/:call_id/accept", s.inflight.middleware(), standardAuth, s.codexLiveHandler.HandleSIPControl)
+	s.engine.POST("/v1/realtime/calls/:call_id/reject", s.inflight.middleware(), standardAuth, s.codexLiveHandler.HandleSIPControl)
+	s.engine.POST("/v1/realtime/calls/:call_id/refer", s.inflight.middleware(), standardAuth, s.codexLiveHandler.HandleSIPControl)
 
 	openaiV1 := s.engine.Group("/openai/v1")
-	openaiV1.Use(AuthMiddleware(s.accessManager))
+	openaiV1.Use(s.inflight.middleware(), AuthMiddleware(s.accessManager))
 	{
 		openaiV1.POST("/videos", openaiHandlers.VideosCreate)
 		openaiV1.GET("/videos/:video_id/content", openaiHandlers.VideosContent)
@@ -121,7 +124,7 @@ func (s *Server) setupRoutes() {
 
 	// Codex CLI direct route aliases (chatgpt_base_url compatible)
 	codexDirect := s.engine.Group("/backend-api/codex")
-	codexDirect.Use(AuthMiddleware(s.accessManager))
+	codexDirect.Use(s.inflight.middleware(), AuthMiddleware(s.accessManager))
 	{
 		codexDirect.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
 		codexDirect.POST("/responses", openaiResponsesHandlers.Responses)
@@ -131,7 +134,7 @@ func (s *Server) setupRoutes() {
 
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")
-	v1beta.Use(AuthMiddleware(s.accessManager))
+	v1beta.Use(s.inflight.middleware(), AuthMiddleware(s.accessManager))
 	{
 		v1beta.GET("/models", s.geminiModelsHandler(geminiHandlers))
 		v1beta.POST("/interactions", geminiHandlers.Interactions)

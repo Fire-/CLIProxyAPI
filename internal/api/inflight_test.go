@@ -65,6 +65,7 @@ func TestInflightGaugeIgnoresWebsocketUpgrades(t *testing.T) {
 
 	go func() {
 		request := httptest.NewRequest(http.MethodGet, "/ws", nil)
+		request.Header.Set("Connection", "Upgrade")
 		request.Header.Set("Upgrade", "websocket")
 		router.ServeHTTP(httptest.NewRecorder(), request)
 	}()
@@ -91,5 +92,65 @@ func TestHandleInflightReportsTheGauge(t *testing.T) {
 	}
 	if body := recorder.Body.String(); !strings.Contains(body, `"inflight":1`) {
 		t.Fatalf("expected the gauge to report one in-flight request, got %s", body)
+	}
+}
+
+// Only a GET can upgrade, so the header on any other method must not hide work from the
+// gauge - that is the one mistake the restart gate cannot make.
+func TestInflightGaugeCountsNonUpgradeRequestWithUpgradeHeader(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var gauge inflightGauge
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+
+	router := gin.New()
+	router.Use(gauge.middleware())
+	router.POST("/v1/chat/completions", func(c *gin.Context) {
+		entered <- struct{}{}
+		<-release
+		c.Status(http.StatusOK)
+	})
+
+	go func() {
+		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		request.Header.Set("Connection", "Upgrade")
+		request.Header.Set("Upgrade", "websocket")
+		router.ServeHTTP(httptest.NewRecorder(), request)
+	}()
+	<-entered
+	if active, _ := gauge.snapshot(); active != 1 {
+		t.Fatalf("a POST carrying an Upgrade header must still count, got %d in-flight", active)
+	}
+	close(release)
+}
+
+func TestIsWebsocketUpgradeRequiresAGet(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cases := []struct {
+		name       string
+		method     string
+		connection string
+		upgrade    string
+		want       bool
+	}{
+		{"handshake", http.MethodGet, "Upgrade", "websocket", true},
+		{"case folded", http.MethodGet, "upgrade", "WebSocket", true},
+		{"token lists", http.MethodGet, "keep-alive, Upgrade", "websocket, h2c", true},
+		{"no connection header", http.MethodGet, "", "websocket", false},
+		{"post cannot upgrade", http.MethodPost, "Upgrade", "websocket", false},
+		{"neither header", http.MethodGet, "", "", false},
+	}
+	for _, tc := range cases {
+		context, _ := gin.CreateTestContext(httptest.NewRecorder())
+		context.Request = httptest.NewRequest(tc.method, "/", nil)
+		if tc.connection != "" {
+			context.Request.Header.Set("Connection", tc.connection)
+		}
+		if tc.upgrade != "" {
+			context.Request.Header.Set("Upgrade", tc.upgrade)
+		}
+		if got := isWebsocketUpgrade(context); got != tc.want {
+			t.Errorf("%s: isWebsocketUpgrade = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
