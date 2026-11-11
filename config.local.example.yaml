@@ -1,0 +1,32 @@
+# Template for ~/.cli-proxy-api/config.yaml (the runtime config, which stays outside
+# this repo and holds secrets). Values here are placeholders, not live keys.
+config-version: 8
+
+server:
+  # Localhost only: the T3 server on this Mac is the sole client of the hub.
+  host: "127.0.0.1"
+  port: 8317
+
+management:
+  # Config-file only; cannot be changed through the management API.
+  allow-remote: false
+  # Required. Without it every /v0/management route returns 404.
+  # Generate with: mise run management-key
+  secret-key: "<openssl rand -base64 32>"
+
+access:
+  # Client key for the proxy API itself (not an upstream provider key).
+  # Only needed if a provider is later routed through the hub.
+  api-keys:
+    - "<client key for T3 provider routing>"
+
+oauth:
+  # Where OAuth logins write credential files.
+  auth-dir: "~/.cli-proxy-api"
+
+observability:
+  logs:
+    debug: false
+  usage:
+    # Keeps the per-request usage queue live for the management API.
+    usage-statistics-enabled: true
