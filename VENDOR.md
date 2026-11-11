@@ -67,7 +67,15 @@ Push to the fork after each change: `overlay/*` normally (fast-forward), and
 | `mise run tui` | Terminal management UI |
 | `mise run login-codex` / `login-codex-device` / `login-claude` / `login-antigravity` | OAuth logins; credentials land in `CLIPROXYAPI_HOME` |
 | `mise run management-key` | Fresh random management key |
+| `mise run daemon` | Start the supervisor (`scripts/daemon.sh`, detached) |
+| `mise run daemon-stop` | Stop the daemon and the proxy it supervises |
+| `mise run daemon-status` | Daemon, listener, pooled-account count at a glance |
+| `mise run daemon-log` / `server-log` / `logs` | Tail the daemon log / server log / both |
 | `mise run clean` | Remove `bin/`, `.gocache/`, `.tmp/` |
+
+The daemon tasks are deliberately **not** sandboxed: they manage a service outside the repo
+(`~/.cli-proxy-api`), and mise's deny flags would block its config, logs, and pid file.
+Everything else that runs project code is sandboxed.
 
 The Go toolchain is pinned by this overlay's `.mise.toml` (`go = "1.26.10"`, matching
 `go.mod`). Build tasks run sandboxed: no network, writes confined to the repo, the module
@@ -117,13 +125,33 @@ export PATH="$HOME/vendor/cliproxyapi/bin:$PATH"
 ### cliproxyapi:end
 ```
 
-### Runner
+### Runner (`scripts/daemon.sh`)
 
-Not yet supervisor-managed. For now the proxy is started by hand (`mise run serve`,
-or `mise run daemon` once the daemon script exists) — T3's Limits panel needs it up to
-refresh quotas. The plan is a launchd supervisor per the t3code model, which itself
-manages each tool's own daemon; `scripts/daemon.sh` + `daemon`/`daemon-stop`/`daemon-status`
-tasks are the next overlay (`overlay/daemon`).
+`mise run daemon` starts a detached supervisor that keeps the proxy answering on
+`127.0.0.1:8317` for T3's Limits panel:
+
+- restarts the server on crash, with backoff capped at 120s
+- restarts onto a new build when `bin/cli-proxy-api` changes (any mtime change counts, so a
+  rebuild and a checkout of an older tag both land)
+- health-checks the **management API** with the stashed key, not just the port: a server that
+  answers `/v1/models` while 401ing management is useless to T3
+- falls back to `bin/cli-proxy-api.bak` — the last binary that booted and passed a health
+  check — when a fresh build will not come up, then picks the new build back up on its next
+  mtime change. Upstream has no build tiers, so unlike t3's daemon this one never gives up and
+  exits; it stays up retrying.
+- re-execs itself when `scripts/daemon.sh` changes, adopting the live server
+- adopts a server on its own port that it did not start (a self-re-exec, or a manual
+  `mise run serve`), port-scoped through `lsof` so it never touches another tool's process
+
+Unlike t3 there is **no idle gate**, because the hub only serves quota reads and the server
+drains in-flight requests on SIGTERM. That changes the moment provider traffic is routed
+through the hub — add a gate before doing that.
+
+Logs live in the runtime dir: `daemon.log` (supervisor) and `daemon.log.server` (server stdout,
+truncated on each start). `mise run daemon-status` summarizes both plus the pooled-account count.
+
+Still missing: a launchd supervisor that owns this daemon's lifecycle at login, per the t3code
+plan (a supervisor which itself manages each tool's daemon).
 
 ## Connecting T3 Code
 

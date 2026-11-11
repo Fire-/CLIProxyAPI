@@ -84,3 +84,113 @@ run = "mise run install && mise run build"
 [tasks.clean]
 description = "Remove build outputs and the local Go build cache"
 run = ["rm -rf bin .gocache .tmp"]
+
+# The daemon tasks manage a service outside the repo (~/.cli-proxy-api), so they are
+# deliberately not sandboxed: mise's deny flags would block the runtime config, logs,
+# and pid file.
+[tasks.daemon]
+description = "Start the proxy supervisor (detached, survives everything)"
+run = '''
+RUNTIME="${CLIPROXYAPI_HOME:-$HOME/.cli-proxy-api}"
+PID_FILE="$RUNTIME/daemon.pid"
+if [[ -f "$PID_FILE" ]]; then
+  existing=$(cat "$PID_FILE" 2>/dev/null || echo "")
+  if [[ -n "$existing" ]] && kill -0 "$existing" 2>/dev/null; then
+    echo "Daemon already running (PID $existing). Use 'mise run daemon-stop' first."
+    exit 1
+  fi
+  echo "Stale PID file found, removing"
+  rm -f "$PID_FILE"
+fi
+if [[ ! -x "{{config_root}}/bin/cli-proxy-api" ]]; then
+  echo "No binary at {{config_root}}/bin/cli-proxy-api - run 'mise run build' first."
+  exit 1
+fi
+mkdir -p "$RUNTIME"
+nohup bash "{{config_root}}/scripts/daemon.sh" > "$RUNTIME/daemon.log" 2>&1 < /dev/null &
+disown
+ok=""
+for i in 1 2 3 4 5 6; do
+  [[ -f "$PID_FILE" ]] && { ok=1; break; }
+  sleep 0.5
+done
+if [[ -n "$ok" ]]; then
+  echo "Daemon started (PID $(cat "$PID_FILE")). Logs: mise run daemon-log"
+else
+  echo "ERROR: daemon failed to start - check $RUNTIME/daemon.log"
+  exit 1
+fi
+'''
+
+[tasks.daemon-stop]
+description = "Stop the daemon and the proxy it supervises"
+run = '''
+RUNTIME="${CLIPROXYAPI_HOME:-$HOME/.cli-proxy-api}"
+PID_FILE="$RUNTIME/daemon.pid"
+if [[ ! -f "$PID_FILE" ]]; then
+  echo "No daemon PID file - nothing to stop."
+  exit 0
+fi
+pid=$(cat "$PID_FILE" 2>/dev/null || echo "")
+if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+  kill "$pid" 2>/dev/null || true
+  # Wait for the daemon to actually exit (it stops the server on the way out).
+  for i in $(seq 1 40); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.25
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "Daemon did not exit in 10s, force killing"
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+fi
+rm -f "$PID_FILE"
+echo "Daemon stopped"
+'''
+
+[tasks.daemon-status]
+description = "Daemon, listener, and pooled-account health at a glance"
+run = '''
+RUNTIME="${CLIPROXYAPI_HOME:-$HOME/.cli-proxy-api}"
+PID_FILE="$RUNTIME/daemon.pid"
+PORT="${CLIPROXYAPI_PORT:-8317}"
+if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
+  echo "daemon: running (PID $(cat "$PID_FILE"))"
+else
+  echo "daemon: not running (mise run daemon)"
+fi
+pid=$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)
+if [[ -n "$pid" ]]; then
+  echo "server: listening on $PORT (PID $pid)"
+else
+  echo "server: not listening on $PORT"
+fi
+key=$(cat "$RUNTIME/management-key.txt" 2>/dev/null || true)
+if [[ -n "$key" ]]; then
+  files=$(curl -sf --max-time 3 -H "Authorization: Bearer $key" \
+    "http://127.0.0.1:$PORT/v0/management/auth-files" 2>/dev/null || true)
+  if [[ -n "$files" ]]; then
+    count=$(printf '%s' "$files" | grep -o '"auth_index"' | wc -l | tr -d ' ')
+    echo "hub: management API ok, $count pooled account(s)"
+  else
+    echo "hub: management API not answering"
+  fi
+else
+  echo "hub: no management key at $RUNTIME/management-key.txt"
+fi
+if [[ -x "{{config_root}}/bin/cli-proxy-api.bak" ]]; then
+  echo "fallback build: {{config_root}}/bin/cli-proxy-api.bak"
+fi
+'''
+
+[tasks.daemon-log]
+description = "Tail the daemon log"
+run = 'tail -f "${CLIPROXYAPI_HOME:-$HOME/.cli-proxy-api}/daemon.log"'
+
+[tasks.server-log]
+description = "Tail the proxy server log"
+run = 'tail -f "${CLIPROXYAPI_HOME:-$HOME/.cli-proxy-api}/daemon.log.server"'
+
+[tasks.logs]
+description = "Tail both the daemon and server logs"
+run = 'tail -f "${CLIPROXYAPI_HOME:-$HOME/.cli-proxy-api}/daemon.log" "${CLIPROXYAPI_HOME:-$HOME/.cli-proxy-api}/daemon.log.server"'
