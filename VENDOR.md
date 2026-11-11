@@ -104,11 +104,28 @@ Config shape we use:
 - `oauth.auth-dir: ~/.cli-proxy-api` — where the OAuth logins write.
 - `observability.usage.usage-statistics-enabled: true` — keeps the usage queue live.
 
-Both `management.allow-remote` and `server.host` are config-file only; they cannot be
-changed through the management API. Going remote later is a config edit plus
-re-adding the hub in T3, but prefer `tailscale serve` over binding all interfaces:
-`/v0/management/api-call` issues arbitrary outbound requests with a pooled account's
-credentials, and one bearer key guards the whole management API.
+`management.allow-remote` and `server.host` are normally set in the config file, but they are
+**not** config-file only, and treating them that way understates what the management key
+guards: a caller holding the key can rewrite the whole config through
+`PUT /v0/management/config.yaml` (or `/v8/...`), which persists it and reloads it live, and
+the auth middleware reads `allow-remote` from that live config per request. So the key can
+turn remote management on by itself — on top of `/v0/management/api-call` issuing arbitrary
+outbound requests with a pooled account's credentials. Keep the hub loopback-only; if you
+ever need remote access, prefer `tailscale serve` over binding all interfaces.
+
+Security-relevant behavior of the daemon and its tasks, recorded so an edit does not quietly
+undo it:
+
+- The management key never appears in argv, which any local process can read from `ps`: the
+  health probe and `daemon-status` hand it to curl on stdin (`-K -`).
+- Files the daemon creates are written under `umask 077` and renamed into place (the PID
+  file), and the fallback snapshot uses `mktemp`, so a pre-planted symlink at a predictable
+  name cannot redirect a write.
+- A PID taken from a file or a port lookup is name-checked before signalling, so a recycled
+  PID is never killed.
+- Both logs are trimmed in place at 8 MiB (`CLIPROXYAPI_LOG_MAX_BYTES`). The writers hold them
+  O_APPEND precisely so truncation cannot leave a sparse file — change a redirect to `>` and
+  that property is lost.
 
 **Gotcha: `management.secret-key` is bcrypt-hashed in place on first startup.** Write the
 plaintext once; the server rewrites that line to a `$2a$…` hash and keeps only that. Clients

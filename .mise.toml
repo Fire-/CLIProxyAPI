@@ -1,6 +1,6 @@
 # Toolchain, build, and run tasks for our vendored CLIProxyAPI clone.
 # Tracked on overlay/dev-infra (see VENDOR.md). Base is the latest upstream release tag.
-# Upgrade: git fetch origin --tags, move the base tag in `mise run retag`/VENDOR.md, then `mise run update`.
+# Upgrade: git fetch origin --tags, move the base tag, then `mise run update`.
 
 [tools]
 # Matches the `go` directive in go.mod; mise keeps the toolchain out of the repo.
@@ -18,9 +18,10 @@ run = "go mod download"
 [tasks.build]
 description = "Offline release build; binary lands in bin/cli-proxy-api"
 depends = ["fetch"]
-env = { GOCACHE = "{{config_root}}/.gocache", TMPDIR = "{{config_root}}/.tmp" }
+# Both scratch dirs sit under the ignored .gocache/, so a build never dirties the tree.
+env = { GOCACHE = "{{config_root}}/.gocache", TMPDIR = "{{config_root}}/.gocache/tmp" }
 run = [
-  "mkdir -p bin .tmp",
+  "mkdir -p bin .gocache/tmp",
   "go build -o bin/cli-proxy-api ./cmd/server",
   "go version -m bin/cli-proxy-api | head -2",
 ]
@@ -35,8 +36,8 @@ allow_write = [
 [tasks.test]
 description = "Run the upstream test suite (offline)"
 depends = ["fetch"]
-env = { GOCACHE = "{{config_root}}/.gocache", TMPDIR = "{{config_root}}/.tmp" }
-run = ["mkdir -p .tmp", "go test ./..."]
+env = { GOCACHE = "{{config_root}}/.gocache", TMPDIR = "{{config_root}}/.gocache/tmp" }
+run = ["mkdir -p .gocache/tmp", "go test ./..."]
 deny_net = true
 allow_write = [
   "{{config_root}}",
@@ -83,11 +84,11 @@ run = "mise run install && mise run build"
 
 [tasks.clean]
 description = "Remove build outputs and the local Go build cache"
-run = ["rm -rf bin .gocache .tmp"]
+run = ["rm -rf bin .gocache"]
 
 # The daemon tasks manage a service outside the repo (~/.cli-proxy-api), so they are
 # deliberately not sandboxed: mise's deny flags would block the runtime config, logs,
-# and pid file.
+# and pid file. The health probe needs loopback network, which deny_net blocks.
 [tasks.daemon]
 description = "Start the proxy supervisor (detached, survives everything)"
 run = '''
@@ -106,8 +107,10 @@ if [[ ! -x "{{config_root}}/bin/cli-proxy-api" ]]; then
   echo "No binary at {{config_root}}/bin/cli-proxy-api - run 'mise run build' first."
   exit 1
 fi
+umask 077
 mkdir -p "$RUNTIME"
-nohup bash "{{config_root}}/scripts/daemon.sh" > "$RUNTIME/daemon.log" 2>&1 < /dev/null &
+# Append: the daemon trims this file in place, which needs an O_APPEND writer.
+nohup bash "{{config_root}}/scripts/daemon.sh" >> "$RUNTIME/daemon.log" 2>&1 < /dev/null &
 disown
 ok=""
 for i in 1 2 3 4 5 6; do
@@ -133,6 +136,13 @@ if [[ ! -f "$PID_FILE" ]]; then
 fi
 pid=$(cat "$PID_FILE" 2>/dev/null || echo "")
 if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+  # A recycled PID must not be signalled: only kill what is still our daemon.
+  cmd=$(ps -p "$pid" -o command= 2>/dev/null | tr -d ' ')
+  if [[ -n "$cmd" && "$cmd" != *scripts/daemon.sh* ]]; then
+    echo "PID $pid is not the daemon any more ($cmd); removing the stale PID file only."
+    rm -f "$PID_FILE"
+    exit 0
+  fi
   kill "$pid" 2>/dev/null || true
   # Wait for the daemon to actually exit (it stops the server on the way out).
   for i in $(seq 1 40); do
@@ -167,8 +177,9 @@ else
 fi
 key=$(cat "$RUNTIME/management-key.txt" 2>/dev/null || true)
 if [[ -n "$key" ]]; then
-  files=$(curl -sf --max-time 3 -H "Authorization: Bearer $key" \
-    "http://127.0.0.1:$PORT/v0/management/auth-files" 2>/dev/null || true)
+  # -K - keeps the key out of argv, where any local process can read it from ps.
+  files=$(printf 'header = "Authorization: Bearer %s"\n' "$key" |
+    curl -sf --max-time 3 -K - "http://127.0.0.1:$PORT/v0/management/auth-files" 2>/dev/null || true)
   if [[ -n "$files" ]]; then
     count=$(printf '%s' "$files" | grep -o '"auth_index"' | wc -l | tr -d ' ')
     echo "hub: management API ok, $count pooled account(s)"

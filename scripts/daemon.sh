@@ -16,6 +16,8 @@
 # not give up: it stays up retrying the last binary it has, and picks up a fixed
 # build on that binary's next mtime change.
 #
+# macOS-first (BSD `stat`, `lsof`); the stat helpers fall back to GNU coreutils.
+#
 # Started via: mise run daemon  (nohup + disown, survives everything)
 
 set -euo pipefail
@@ -29,6 +31,7 @@ RUNTIME_DIR="${CLIPROXYAPI_HOME:-$HOME/.cli-proxy-api}"
 CONFIG="$RUNTIME_DIR/config.yaml"
 KEY_FILE="$RUNTIME_DIR/management-key.txt"
 PID_FILE="$RUNTIME_DIR/daemon.pid"
+LOG_FILE="$RUNTIME_DIR/daemon.log"
 SERVER_LOG="$RUNTIME_DIR/daemon.log.server"
 PORT="${CLIPROXYAPI_PORT:-8317}"
 PROBE_HOST="127.0.0.1"
@@ -38,6 +41,7 @@ HEALTH_URL="http://$PROBE_HOST:$PORT/v0/management/auth-files"
 BIN_CHECK_INTERVAL="${CLIPROXYAPI_BIN_CHECK_INTERVAL:-30}"
 HEALTH_TIMEOUT="${CLIPROXYAPI_HEALTH_TIMEOUT:-60}"
 MAX_CRASH_RETRIES="${CLIPROXYAPI_MAX_CRASH_RETRIES:-5}"
+LOG_MAX_BYTES="${CLIPROXYAPI_LOG_MAX_BYTES:-$((8 * 1024 * 1024))}"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 # ── State ──────────────────────────────────────────────────────────────────
@@ -55,7 +59,25 @@ fi
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >&2; }
 
-binary_mtime() { stat -f %m "$BIN" 2>/dev/null || echo 0; }
+# BSD stat first; the numeric guard keeps a wrong-format stat from poisoning the
+# comparisons below.
+mtime_of() {
+	local v
+	v=$(stat -f %m "$1" 2>/dev/null || true)
+	[[ "$v" =~ ^[0-9]+$ ]] || v=$(stat -c %Y "$1" 2>/dev/null || true)
+	[[ "$v" =~ ^[0-9]+$ ]] || v=0
+	echo "$v"
+}
+
+size_of() {
+	local v
+	v=$(stat -f %z "$1" 2>/dev/null || true)
+	[[ "$v" =~ ^[0-9]+$ ]] || v=$(stat -c %s "$1" 2>/dev/null || true)
+	[[ "$v" =~ ^[0-9]+$ ]] || v=0
+	echo "$v"
+}
+
+binary_mtime() { mtime_of "$BIN"; }
 
 # Any change counts, not just a newer mtime: a rebuild and a checkout of an older
 # tag both land here.
@@ -65,16 +87,34 @@ binary_changed() {
 	[[ "$mtime" -gt 0 && "$mtime" -ne "$last_binary_mtime" ]]
 }
 
+# A PID from a file or a port lookup can be recycled. Fails open when ps tells us
+# nothing (the PID is then more likely ours than not), closed on a positive
+# mismatch: the last thing this daemon should do is signal an unrelated process.
+looks_like_our_server() {
+	local pid="${1:-}" cmd
+	[[ -n "$pid" ]] || return 1
+	cmd=$(ps -p "$pid" -o command= 2>/dev/null | tr -d ' ')
+	[[ -z "$cmd" ]] && return 0
+	[[ "$cmd" == *cli-proxy-api* ]]
+}
+
 # ── Server management ──────────────────────────────────────────────────────
 start_server() {
 	local bin="$1" label="$2"
-	"$bin" --config "$CONFIG" >"$SERVER_LOG" 2>&1 &
+	# Append, not truncate: both log writers being O_APPEND is what lets trim_logs
+	# truncate in place without leaving a sparse file.
+	"$bin" --config "$CONFIG" >>"$SERVER_LOG" 2>&1 &
 	server_pid=$!
 	log "Started $label (PID $server_pid) on port $PORT"
 }
 
 stop_server() {
 	if [[ -n "${server_pid:-}" ]] && kill -0 "$server_pid" 2>/dev/null; then
+		if ! looks_like_our_server "$server_pid"; then
+			log "PID $server_pid is not cli-proxy-api any more - leaving it alone"
+			server_pid=""
+			return 0
+		fi
 		log "Stopping server (PID $server_pid)..."
 		kill "$server_pid" 2>/dev/null || true
 		local i=0
@@ -92,11 +132,12 @@ stop_server() {
 }
 
 # Adopt a server on our port that this daemon did not start (a self-re-exec, or a
-# manual `mise run serve`). Port-scoped so we never touch another tool's process.
+# manual `mise run serve`). Port-scoped and name-checked: anything else that grabs
+# the port is left running and never adopted.
 adopt_server() {
 	local pid
 	pid=$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)
-	if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+	if looks_like_our_server "$pid" && kill -0 "$pid" 2>/dev/null; then
 		server_pid="$pid"
 		return 0
 	fi
@@ -108,8 +149,10 @@ probes_health() {
 	local key code
 	key=$(cat "$KEY_FILE" 2>/dev/null || true)
 	if [[ -n "$key" ]]; then
-		code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
-			-H "Authorization: Bearer $key" "$HEALTH_URL" 2>/dev/null || true)
+		# -K - feeds curl its header on stdin. argv is world-readable through ps, and
+		# this key guards an API that can mint outbound calls with pooled credentials.
+		code=$(printf 'header = "Authorization: Bearer %s"\n' "$key" |
+			curl -s -o /dev/null -w '%{http_code}' --max-time 3 -K - "$HEALTH_URL" 2>/dev/null || true)
 		[[ "$code" == "200" ]]
 		return
 	fi
@@ -129,15 +172,32 @@ health_check() {
 	return 1
 }
 
-# Keep the binary that just proved healthy. Written through a temp file so a
-# fallback copy is never truncated underneath a running process.
+# Keep the binary that just proved healthy. mktemp, so a pre-planted symlink at a
+# predictable name cannot redirect the copy over something else.
 snapshot_bak() {
+	local tmp
 	if [[ ! -x "$BIN" ]] || cmp -s "$BIN" "$BAK" 2>/dev/null; then
 		return 0
 	fi
-	if cp "$BIN" "$BAK.tmp" && mv -f "$BAK.tmp" "$BAK"; then
+	tmp=$(mktemp "$BAK.XXXXXX") || return 0
+	if cp "$BIN" "$tmp" && mv -f "$tmp" "$BAK"; then
 		log "Saved the healthy build to $BAK"
+	else
+		rm -f "$tmp"
 	fi
+}
+
+# The daemon is meant to run for months, so cap both logs. Both writers open with
+# O_APPEND, so truncating in place is safe; the trimmed file simply starts over.
+trim_logs() {
+	local log
+	for log in "$LOG_FILE" "$SERVER_LOG"; do
+		[[ -f "$log" ]] || continue
+		if [[ $(size_of "$log") -gt $LOG_MAX_BYTES ]]; then
+			: >"$log"
+			log "Trimmed $log at $((LOG_MAX_BYTES / 1024 / 1024)) MiB"
+		fi
+	done
 }
 
 # Restart onto the current build, falling back to the last known-good binary when
@@ -202,10 +262,13 @@ if [[ -f "$PID_FILE" ]]; then
 fi
 
 mkdir -p "$RUNTIME_DIR"
-echo $$ >"$PID_FILE"
+# Secrets and logs live here; write a per-process PID file and rename it into
+# place so a pre-planted symlink cannot be followed.
+umask 077
+echo $$ >"$PID_FILE.$$" && mv -f "$PID_FILE.$$" "$PID_FILE"
 log "Daemon started (PID $$) - probing $HEALTH_URL every ${BIN_CHECK_INTERVAL}s"
 
-last_self_mtime=$(stat -f %m "$SELF" 2>/dev/null || echo 0)
+last_self_mtime=$(mtime_of "$SELF")
 last_binary_mtime=$(binary_mtime)
 
 if adopt_server; then
@@ -230,6 +293,8 @@ while true; do
 	# Interruptible sleep: SIGTERM lands in ~0s instead of up to 30s.
 	sleep "$BIN_CHECK_INTERVAL" &
 	wait $! || true
+
+	trim_logs
 
 	# Crash recovery
 	if [[ -z "$server_pid" ]] || ! kill -0 "$server_pid" 2>/dev/null; then
@@ -263,7 +328,7 @@ while true; do
 
 	# Self-update: re-exec when this script changes (the new instance adopts the
 	# running server, so the hub stays up).
-	self_mtime=$(stat -f %m "$SELF" 2>/dev/null || echo 0)
+	self_mtime=$(mtime_of "$SELF")
 	if [[ "$self_mtime" -gt "$last_self_mtime" ]]; then
 		if bash -n "$SELF" 2>/dev/null; then
 			log "Daemon script changed - re-execing with the new code (server stays up)"
