@@ -25,7 +25,7 @@ credits). Stock upstream supports both endpoints; no fork is required for that p
 origin          ← upstream router-for-me/CLIProxyAPI (never commit here)
 fork            ← git@github.com:Fire-/CLIProxyAPI.git
 v8.0.66         ← pinned release tag; the base every overlay is applied to
-├── overlay/*   ← one topic each; overlay/dev-infra holds .mise.toml and this file
+├── overlay/*   ← one topic each: dev-infra = tooling (tasks, docs), inflight = an internal/api patch
 └── local       ← integration branch: base tag + every overlay (merge commits ONLY)
 ```
 
@@ -50,8 +50,9 @@ Rules:
   would stamp the old tag onto newer code.
 - **A file two overlays need moves to `overlay/dev-infra`**, removed from the others.
   Two overlays editing the same lines conflict on every rebuild otherwise.
-- Never modify vendored upstream source for tooling reasons; config and tasks live
-  in this overlay only.
+- **Tooling never touches vendored source.** Config, tasks, and this file live in
+  `overlay/dev-infra`. A genuine feature patch does modify upstream source — that gets its own
+  overlay (see `overlay/inflight`), and the user's approval first.
 - **`local` is rebuilt, never grown.** `mise run rebuild-local` resets it to the base
   tag and merges each `overlay/*` branch once, so it carries **one merge commit per
   overlay branch** — not one per overlay commit. Merging `local` after every single
@@ -157,7 +158,8 @@ picks the change up through the overlay.
 | `mise run management-key` | Fresh random management key |
 | `mise run daemon` | Start the supervisor (`scripts/daemon.sh`, detached) |
 | `mise run daemon-stop` | Stop the daemon and the proxy it supervises |
-| `mise run daemon-status` | Daemon, listener, running build, pooled-account count |
+| `mise run daemon-status` | Daemon, listener, running build, pooled-account count, in-flight requests |
+| `mise run inflight` | What the hub is serving right now (the number the idle gate reads) |
 | `mise run daemon-log` / `server-log` / `logs` | Tail the daemon log / server log / both |
 | `mise run clean` | Remove `bin/` and `.gocache/` |
 
@@ -250,6 +252,8 @@ edited directly. (t3code's VENDOR.md claims otherwise; that claim is about its o
   steps aside to the fallback build instead of retrying it forever
 - restarts onto a new build when `bin/cli-proxy-api` changes (any mtime change counts, so a
   rebuild and a checkout of an older tag both land)
+- waits for the hub to go **idle** before that restart (see the idle gate below), so a rebuild
+  cannot drop a request that is still being answered
 - health-checks the **management API** with the stashed key, not just the port: a server that
   answers `/v1/models` while 401ing management is useless to T3
 - falls back to `bin/cli-proxy-api.bak` — the last binary that booted and passed a health
@@ -270,9 +274,27 @@ edited directly. (t3code's VENDOR.md claims otherwise; that claim is about its o
 - `daemon-stop` also stops an orphaned proxy: a daemon that has to be SIGKILLed never runs the
   cleanup that stops its server, so the task name-checks the listener on the port and kills it.
 
-Unlike t3 there is **no idle gate**, because the hub only serves quota reads and the server
-drains in-flight requests on SIGTERM. That changes the moment provider traffic is routed
-through the hub — add a gate before doing that.
+There is now an **idle gate**, and unlike t3's it had no counter to read: upstream has none,
+so `overlay/inflight` adds one.
+
+- `internal/api/inflight.go` counts proxy requests under `/v1` for as long as their handler
+  runs, streaming included, and reports them at `GET /v0/management/inflight` as
+  `{"inflight": n, "busy_seconds": s}` (`/v8/management/inflight` mirrors it). `mise run
+  inflight` prints it, and `daemon-status` shows it as the `serving:` line.
+- `wait_for_idle` in `scripts/daemon.sh` polls that route before every restart onto a new
+  build and waits for zero, up to `CLIPROXYAPI_IDLE_TIMEOUT` (default 1800s). The gate exists
+  because upstream's shutdown is **not** graceful: `api.Server.Stop` calls `http.Server.Close`
+  under the comment "Close the HTTP server immediately without graceful draining", so a
+  restart during a request drops it. An earlier version of this file claimed the server
+  drained on SIGTERM; that was wrong, and it is why the gate is here.
+- WebSocket upgrades are excluded from the count deliberately: a session lasts as long as its
+  client wants it to, so counting one would report a busy hub for hours and hold every restart
+  back to the timeout. A websocket session is still cut by a restart.
+- An explicit `mise run daemon-stop` is **not** gated — you asked for it. Build-triggered
+  restarts and adoption of a stale build wait; a crash restart does not (nothing is serving).
+- Dependency direction is `dev-infra → overlay/inflight`: the gate reads a route that overlay
+  adds. A build without it skips the wait after three unreadable polls, which is exactly the
+  behaviour this daemon had before the gate existed.
 
 Logs live in the runtime dir: `daemon.log` (supervisor) and `daemon.log.server` (server stdout,
 truncated on each start). `mise run daemon-status` summarizes both, the running build, and the
@@ -297,8 +319,12 @@ with the hub's base URL and an `access.api-keys` entry — separate from usage r
 Build failures in code no overlay touches are upstream's. Fix only what our overlays
 break; anything else gets its own small overlay, with the user's approval first.
 
-This overlay adds four files and modifies no upstream source, so the whole upstream test
-suite is upstream's by definition. One test is a known intermittent failure:
+`overlay/dev-infra` adds four files and modifies no upstream source. `overlay/inflight` adds
+one (`internal/api/inflight.go`, with tests) and edits three (`internal/api/server.go` for the
+gauge field, `server_routes.go` to count the `/v1` group, and `server_management.go` /
+`server_management_v8.go` to report it). That is the whole footprint, so a failure in code no
+overlay touches is still upstream's by definition. One upstream test is a known intermittent
+failure:
 `TestServerResponsesWebsocketReauthorizesEachTurn` (in `internal/api`) races its own
 temp-dir cleanup and fails with `unlinkat .../auth/logs: directory not empty` under load
 while passing on its own. It fails on the clean base tag too, which is how you baseline a
