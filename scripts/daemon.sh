@@ -16,7 +16,8 @@
 # not give up: it stays up retrying the last binary it has, and picks up a fixed
 # build on that binary's next mtime change.
 #
-# macOS-first (BSD `stat`, `lsof`); the stat helpers fall back to GNU coreutils.
+# macOS-first (BSD `stat`, `lsof`, `date -j`); the stat and date helpers fall back to
+# GNU coreutils, so build detection and adoption also work on Linux.
 #
 # Started via: mise run daemon  (nohup + disown, survives everything)
 
@@ -93,11 +94,17 @@ binary_changed() {
 # compares it with the binary mtime: a build that landed after the process started
 # means the live server is running older code than what is on disk.
 process_start_epoch() {
-	local pid="${1:-}" started
+	local pid="${1:-}" started epoch
 	[[ -n "$pid" ]] || { echo 0; return; }
 	started=$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//; s/ *$//')
 	[[ -n "$started" ]] || { echo 0; return; }
-	date -j -f "%a %b %d %T %Y" "$started" "+%s" 2>/dev/null || echo 0
+	# BSD date parses that format explicitly; GNU date has no -j and reads the same
+	# string with -d. Without the fallback every adopted server on Linux looks ageless,
+	# so an older build would latch as current and keep serving until bin/ changed again.
+	epoch=$(date -j -f "%a %b %d %T %Y" "$started" "+%s" 2>/dev/null) ||
+		epoch=$(date -d "$started" "+%s" 2>/dev/null) ||
+		epoch=0
+	echo "${epoch:-0}"
 }
 
 # True when bin/cli-proxy-api is newer than the given epoch. 0 means ps could not
@@ -336,8 +343,10 @@ while true; do
 		crash_count=$((crash_count + 1))
 		log "Server is not running, restarting $(basename "$active_bin") in ${crash_backoff}s (attempt $crash_count)"
 		sleep "$crash_backoff"
-		if ((crash_backoff < 120)); then
-			crash_backoff=$((crash_backoff * 2))
+		# Clamp after doubling: testing first gives 3,6,12,24,48,96,192 and sleeps 192s.
+		crash_backoff=$((crash_backoff * 2))
+		if ((crash_backoff > 120)); then
+			crash_backoff=120
 		fi
 		start_server "$active_bin" "$(basename "$active_bin")"
 		if health_check; then

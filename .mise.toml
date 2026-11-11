@@ -96,9 +96,11 @@ run = "mise run rebuild-local && mise run install"
 # Overlays never stack, so a change two of them need is cherry-picked into each.
 # Copies that drift apart make the merge into local conflict or blend both versions.
 # A cherry-pick always gets a new SHA, so the same SHA in two overlays means one was
-# merged into or branched from the other.
+# merged into or branched from the other. Every overlay must also still sit on the
+# pinned base: one left on a newer tag carries newer code into a build stamped with
+# the pin, and the pin is only moved by `upgrade`.
 [tasks.check-overlays]
-description = "Fail if overlay/* branches stack (share a commit) or a cherry-picked copy drifted"
+description = "Fail if an overlay sits off the pinned base, stacks, or has a drifted cherry-pick"
 run = '''
 set -euo pipefail
 BASE="${CLIPROXYAPI_BASE:?CLIPROXYAPI_BASE is not set}"
@@ -106,8 +108,28 @@ if [ -z "$(git branch --list 'overlay/*' --format='%(refname:short)')" ]; then
   echo "check-overlays: no overlay branches yet"
   exit 0
 fi
+
+# The base every overlay was applied to is the tag git describe finds nearest to it.
+off_base=""
 for b in $(git branch --list 'overlay/*' --format='%(refname:short)'); do
-  git log --no-merges -p "$BASE".."$b" | git patch-id --stable |
+  near=$(git describe --tags --abbrev=0 "$b" 2>/dev/null || true)
+  if [ "$near" != "$BASE" ]; then
+    echo "ERROR: $b is based on ${near:-<no tag>}, but the pin is $BASE"
+    off_base=1
+  fi
+done
+if [ -n "$off_base" ]; then
+  echo "Move the pin with 'mise run upgrade' - sync re-overlays but never moves it - or"
+  echo "re-overlay the branch onto $BASE. Building now would stamp $BASE onto newer code."
+  exit 1
+fi
+
+# Compare only the commits an overlay adds on top of upstream: everything reachable from
+# a tag is upstream's, and one upstream commit landing in two overlays is not stacking.
+# (t3code ranges over origin/main here. With a tag pin, --not --tags is that same anchor;
+# BASE..branch would drag in upstream commits once an overlay moves ahead of the pin.)
+for b in $(git branch --list 'overlay/*' --format='%(refname:short)'); do
+  git log --no-merges -p "$b" --not --tags | git patch-id --stable |
     while read -r pid sha; do
       printf '%s\t%s\t%s\t%s\n' "$(git log -1 --format=%s "$sha")" "$pid" "$b" "$sha"
     done
@@ -135,11 +157,11 @@ done | awk -F'\t' '
   }'
 '''
 
-# Read-only: it fetches tags and predicts, but never moves the base. Exit 1 means at
-# least one overlay would conflict, so `mise run upgrade` must not be run until those
-# are re-overlaid by hand.
+# Fetches tags (moving refs, and the reason it is only "read-only" about your branches)
+# but never moves the base. Exit 1 means at least one overlay would conflict, so
+# `mise run upgrade` must not be run until those are re-overlaid by hand.
 [tasks.check-upstream]
-description = "Read-only: newest upstream tag, what changed, and which overlays would conflict"
+description = "Newest upstream tag, what changed, and which overlays would conflict (never moves the base)"
 run = '''
 set -eu
 BASE="${CLIPROXYAPI_BASE:?CLIPROXYAPI_BASE is not set}"
@@ -147,6 +169,12 @@ git fetch origin --tags --quiet
 TARGET="${CLIPROXYAPI_TARGET_TAG:-$(git tag -l 'v*' --sort=-v:refname | head -1)}"
 if [ -z "$TARGET" ]; then
   echo "ERROR: no v* tags found - is the origin remote reachable?"
+  exit 1
+fi
+# A misspelled CLIPROXYAPI_TARGET_TAG would otherwise be reported as a conflict against a
+# tag that does not exist.
+if ! git rev-parse --verify --quiet "refs/tags/$TARGET" >/dev/null; then
+  echo "ERROR: no tag $TARGET here - fetched from origin, and spelled right?"
   exit 1
 fi
 echo "base:   $BASE"
@@ -201,6 +229,12 @@ git fetch origin --tags --quiet
 TARGET="${CLIPROXYAPI_TARGET_TAG:-$(git tag -l 'v*' --sort=-v:refname | head -1)}"
 if [ -z "$TARGET" ]; then
   echo "ERROR: no v* tags found - is the origin remote reachable?"
+  exit 1
+fi
+# A misspelled CLIPROXYAPI_TARGET_TAG would otherwise be reported as a conflict against a
+# tag that does not exist.
+if ! git rev-parse --verify --quiet "refs/tags/$TARGET" >/dev/null; then
+  echo "ERROR: no tag $TARGET here - fetched from origin, and spelled right?"
   exit 1
 fi
 start_branch=$(git branch --show-current)
@@ -271,6 +305,12 @@ if [ -z "$TARGET" ]; then
   echo "ERROR: no v* tags found - is the origin remote reachable?"
   exit 1
 fi
+# A misspelled CLIPROXYAPI_TARGET_TAG would otherwise be reported as a conflict against a
+# tag that does not exist.
+if ! git rev-parse --verify --quiet "refs/tags/$TARGET" >/dev/null; then
+  echo "ERROR: no tag $TARGET here - fetched from origin, and spelled right?"
+  exit 1
+fi
 if [ "$TARGET" = "$BASE" ]; then
   echo "upgrade: already on $BASE"
   exit 0
@@ -283,11 +323,19 @@ fi
 echo "upgrading $BASE -> $TARGET"
 
 # 1. Re-overlay every overlay that merges cleanly. Conflicts stop the run before the
-#    base moves, so a half-upgraded tree is not possible.
-mise run sync
+#    base moves, so a half-upgraded tree is not possible. Hand $TARGET over instead of
+#    letting sync find it again: a tag cut in between would leave the pin and the
+#    overlays sitting on different tags.
+CLIPROXYAPI_TARGET_TAG="$TARGET" mise run sync
 
 # 2. Move the pin. The overlays now sit on $TARGET, so local is rebuilt from it next.
-sed -i '' "s/^CLIPROXYAPI_BASE = \".*\"\$/CLIPROXYAPI_BASE = \"$TARGET\"/" .mise.toml
+#    Rewritten through a temp file: `sed -i ''` is BSD-only, and GNU sed would take the
+#    empty suffix as its script and the s-command as a filename, dying mid-upgrade with
+#    every overlay already moved.
+pin_tmp=$(mktemp "${TMPDIR:-/tmp}/cliproxyapi-mise.XXXXXX")
+sed "s/^CLIPROXYAPI_BASE = \".*\"\$/CLIPROXYAPI_BASE = \"$TARGET\"/" .mise.toml > "$pin_tmp"
+chmod 644 "$pin_tmp"
+mv -f "$pin_tmp" .mise.toml
 if ! grep -q "^CLIPROXYAPI_BASE = \"$TARGET\"\$" .mise.toml; then
   echo "ERROR: could not rewrite CLIPROXYAPI_BASE in .mise.toml"
   exit 1
@@ -305,7 +353,12 @@ mise run build
 
 echo
 echo "upgraded to $TARGET. The daemon picks the new build up on its next mtime check."
-echo "Push with: git push fork overlay/dev-infra && git push --force-with-lease fork local"
+echo "Push with:"
+# Every overlay moved, not just dev-infra: sync re-overlays all of them.
+for b in $(git branch --list 'overlay/*' --format='%(refname:short)'); do
+  echo "  git push fork $b"
+done
+echo "  git push --force-with-lease fork local"
 '''
 
 [tasks.rebuild-local]
@@ -318,13 +371,23 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   git status --short
   exit 1
 fi
-mise run check-overlays
+# Tags first: check-overlays reads each overlay's base through them.
 git fetch origin --tags --quiet
+mise run check-overlays
 git checkout -q local
 # Safe because local holds merge commits only: every unique change lives on an
 # overlay branch, so this reset loses nothing. It is the only place a hard reset runs.
 git reset --hard "$BASE"
+# dev-infra first, then the rest by name: overlays lean on the tasks and config it
+# carries, and merge order decides which side wins where two touch the same lines.
+ordered=""
+if git show-ref --verify --quiet refs/heads/overlay/dev-infra; then
+  ordered="overlay/dev-infra"
+fi
 for b in $(git branch --list 'overlay/*' --format='%(refname:short)' | sort); do
+  if [ "$b" != "overlay/dev-infra" ]; then ordered="$ordered $b"; fi
+done
+for b in $ordered; do
   echo "merging $b"
   # rerere stages recorded conflict resolutions but the merge still exits non-zero.
   # Concluding it keeps the sequence moving; a genuinely new conflict leaves unmerged
@@ -353,7 +416,13 @@ RUNTIME="${CLIPROXYAPI_HOME:-$HOME/.cli-proxy-api}"
 PID_FILE="$RUNTIME/daemon.pid"
 if [[ -f "$PID_FILE" ]]; then
   existing=$(cat "$PID_FILE" 2>/dev/null || echo "")
+  is_live=0
   if [[ -n "$existing" ]] && kill -0 "$existing" 2>/dev/null; then
+    # A recycled PID must not block startup: only a running daemon counts as running.
+    cmd=$(ps -p "$existing" -o command= 2>/dev/null | tr -d ' ')
+    if [[ -z "$cmd" || "$cmd" == *scripts/daemon.sh* ]]; then is_live=1; fi
+  fi
+  if ((is_live)); then
     echo "Daemon already running (PID $existing). Use 'mise run daemon-stop' first."
     exit 1
   fi
@@ -387,6 +456,7 @@ description = "Stop the daemon and the proxy it supervises"
 run = '''
 RUNTIME="${CLIPROXYAPI_HOME:-$HOME/.cli-proxy-api}"
 PID_FILE="$RUNTIME/daemon.pid"
+PORT="${CLIPROXYAPI_PORT:-8317}"
 if [[ ! -f "$PID_FILE" ]]; then
   echo "No daemon PID file - nothing to stop."
   exit 0
@@ -409,6 +479,15 @@ if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
   if kill -0 "$pid" 2>/dev/null; then
     echo "Daemon did not exit in 10s, force killing"
     kill -9 "$pid" 2>/dev/null || true
+    # SIGKILL skips the daemon's cleanup, and that cleanup is what stops the server it
+    # supervises, so the force-killed daemon leaves the proxy holding the port.
+    sleep 0.5
+    orphan=$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)
+    cmd=$(ps -p "${orphan:-0}" -o command= 2>/dev/null | tr -d ' ')
+    if [[ -n "$orphan" && "$cmd" == *cli-proxy-api* ]]; then
+      echo "Killing the orphaned proxy on port $PORT (PID $orphan)"
+      kill "$orphan" 2>/dev/null || true
+    fi
   fi
 fi
 rm -f "$PID_FILE"
