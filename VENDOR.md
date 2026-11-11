@@ -24,7 +24,7 @@ credits). Stock upstream supports both endpoints; no fork is required for that p
 ```
 origin          ← upstream router-for-me/CLIProxyAPI (never commit here)
 fork            ← git@github.com:Fire-/CLIProxyAPI.git
-v8.0.65         ← pinned release tag; the base every overlay is applied to
+v8.0.66         ← pinned release tag; the base every overlay is applied to
 ├── overlay/*   ← one topic each; overlay/dev-infra holds .mise.toml and this file
 └── local       ← integration branch: base tag + every overlay (merge commits ONLY)
 ```
