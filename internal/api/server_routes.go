@@ -97,6 +97,9 @@ func (s *Server) setupRoutes() {
 		v1.GET("/live/:call_id", s.codexLiveHandler.HandleSideband)
 	}
 
+	// A websocket tunnel, so it is deliberately not counted: like the realtime websockets a
+	// tunnel lives as long as its client wants, and counting one would hold every restart to
+	// the idle gate's cap.
 	s.engine.GET("/v1/tunnel", s.handleWebsocketTunnel)
 	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodHead, http.MethodTrace, http.MethodConnect} {
 		s.engine.Handle(method, "/v1/tunnel", s.handleWebsocketTunnel)
@@ -142,7 +145,7 @@ func (s *Server) setupRoutes() {
 
 	// Muse Code CLI direct endpoints (beside /v1)
 	museCode := s.engine.Group("/muse-code")
-	museCode.Use(AuthMiddleware(s.accessManager))
+	museCode.Use(s.inflight.middleware(), AuthMiddleware(s.accessManager))
 	{
 		museCode.GET("/models", s.museCodeHandler.HandleModels)
 		museCode.GET("/config", s.museCodeHandler.Handle)
