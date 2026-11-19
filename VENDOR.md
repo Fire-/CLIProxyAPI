@@ -24,7 +24,7 @@ credits). Stock upstream supports both endpoints; no fork is required for that p
 ```
 origin          ← upstream router-for-me/CLIProxyAPI (never commit here)
 fork            ← git@github.com:Fire-/CLIProxyAPI.git
-v8.0.66         ← pinned release tag; the base every overlay is applied to
+v8.0.78         ← pinned release tag; the base every overlay is applied to
 ├── overlay/*   ← one topic each: dev-infra = tooling (tasks, docs), inflight = an internal/api patch
 └── local       ← integration branch: base tag + every overlay (merge commits ONLY)
 ```
@@ -84,7 +84,7 @@ mise run upgrade          # re-overlay onto that tag, move the pin, rebuild, bui
 `mise run upgrade` does, in order: re-overlay every `overlay/*` onto the new tag
 (`sync`), rewrite `CLIPROXYAPI_BASE` and commit that on `overlay/dev-infra`, rebuild
 `local`, then build. It refuses to run from any branch but `overlay/dev-infra`, and
-refuses to start with a dirty tree. Set `CLIPROXYAPI_TARGET_TAG=v8.0.66` to move to a
+refuses to start with a dirty tree. Set `CLIPROXYAPI_TARGET_TAG=v8.0.78` to move to a
 specific tag instead of the newest one.
 
 The tag it resolved is handed to `sync` rather than looked up again, so a release cut
@@ -99,7 +99,7 @@ overlay first: overlays that merge cleanly are re-overlaid, conflicting ones are
 completely untouched and listed. Resolve those by hand, one at a time:
 
 ```bash
-bash ~/code/git-overlay/git-overlay v8.0.66 overlay/<name>
+bash ~/code/git-overlay/git-overlay v8.0.78 overlay/<name>
 # resolve the conflicts, then:
 git add <files> && bash ~/code/git-overlay/git-overlay --continue
 ```
@@ -284,7 +284,7 @@ so `overlay/inflight` adds one.
 - `internal/api/inflight.go` counts proxy requests for as long as their handler runs, streaming
   included, on **every** proxy surface: the `/v1` group, the `/v1/realtime*` family (registered
   on the engine, so wrapped route by route), `/openai/v1`, `/backend-api/codex` (Codex CLI's
-  alias for the same handlers) and `/v1beta`. Management, health, callback and root routes are
+  alias for the same handlers), `/v1beta` and `/muse-code`. Management, health, callback and root routes are
   not counted, so the daemon's own probing never reads as work. It reports at
   `GET /v0/management/inflight` as `{"inflight": n, "busy_seconds": s}`
   (`/v8/management/inflight` mirrors it). `mise run inflight` prints it, and `daemon-status`
@@ -297,17 +297,26 @@ so `overlay/inflight` adds one.
   route is added there anyway: T3 and every task here already speak `/v0/management`, so the
   tooling stays on one prefix instead of straddling both.
 - `wait_for_idle` in `scripts/daemon.sh` polls that route before every restart onto a new
-  build and waits for zero, up to `CLIPROXYAPI_IDLE_TIMEOUT` (default 1800s). The gate exists
-  because upstream's shutdown is **not** graceful: `api.Server.Stop` calls `http.Server.Close`
-  under the comment "Close the HTTP server immediately without graceful draining", so a
-  restart during a request drops it. An earlier version of this file claimed the server
-  drained on SIGTERM; that was wrong, and it is why the gate is here.
+  build and waits for zero, up to `CLIPROXYAPI_IDLE_TIMEOUT` (default 1800s).
+- **Two layers, and the base move to v8.0.78 added the second one.** At v8.0.66 `api.Server.Stop`
+  called `http.Server.Close` under the comment "Close the HTTP server immediately without
+  graceful draining", so anything in flight died - that is why the gate exists, and why an
+  earlier version of this file was wrong to claim the server drained on SIGTERM. v8.0.77 added
+  `server.shutdown-timeout`: with a positive value, Stop calls `http.Server.Shutdown` and waits
+  that many seconds for in-flight requests before force-closing. We set 120s, so the gate stops
+  a restart from *starting* on a busy hub and the drain covers what arrives in the gap between
+  the gauge reading zero and the signal - the TOCTOU window that cannot be closed from inside
+  the process. `CLIPROXYAPI_STOP_GRACE` (default 150s) is how long the daemon waits before
+  force-killing, and it has to stay above the drain budget or it undoes both layers; a plain
+  `mise run daemon-stop` waits it out too.
 - WebSocket upgrades are excluded from the count deliberately: a session lasts as long as its
   client wants it to, so counting one would report a busy hub for hours and hold every restart
   back to the timeout. Only a GET can upgrade (RFC 6455), so the exclusion is gated on the method
   (`isWebsocketUpgrade`): a stray `Upgrade` header on an ordinary call still counts, because
   under-counting is the one error that makes the gate restart onto a busy hub. A websocket
-  session is still cut by a restart.
+  session is still cut by a restart. `/v1/tunnel`, added in v8.0.78, is a websocket tunnel and
+  stays unwrapped for the same reason: only its non-upgrade methods could ever count, and a
+  tunnel treated as counted work would hold every restart to the cap.
 - An explicit `mise run daemon-stop` is **not** gated — you asked for it. Build-triggered
   restarts and adoption of a stale build wait; a crash restart does not (nothing is serving).
 - Dependency direction is `dev-infra → overlay/inflight`: the gate reads a route that overlay

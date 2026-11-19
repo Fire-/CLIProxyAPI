@@ -6,6 +6,10 @@ server:
   # Localhost only: the T3 server on this Mac is the sole client of the hub.
   host: "127.0.0.1"
   port: 8317
+  # On SIGTERM, wait up to this many seconds for in-flight requests to finish before closing
+  # anything. Upstream's default is 0, which closes immediately and drops them. Keep the
+  # daemon's CLIPROXYAPI_STOP_GRACE above this value; VENDOR.md ("idle gate") pairs the two.
+  shutdown-timeout: 120
 
 management:
   # Not config-file only: anyone holding secret-key can rewrite this whole file through

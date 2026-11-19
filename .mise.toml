@@ -471,13 +471,16 @@ if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
     exit 0
   fi
   kill "$pid" 2>/dev/null || true
-  # Wait for the daemon to actually exit (it stops the server on the way out).
-  for i in $(seq 1 40); do
+  # Wait for the daemon to actually exit. It stops the server on the way out, and that stop is
+  # the server's drain window (server.shutdown-timeout), so a 10s wait here would SIGKILL the
+  # daemon mid-drain - and SIGKILL skips the cleanup that stops the proxy at all.
+  grace="${CLIPROXYAPI_STOP_GRACE:-150}"
+  for i in $(seq 1 $(( (grace + 30) * 4 ))); do
     kill -0 "$pid" 2>/dev/null || break
     sleep 0.25
   done
   if kill -0 "$pid" 2>/dev/null; then
-    echo "Daemon did not exit in 10s, force killing"
+    echo "Daemon did not exit in $((grace + 30))s, force killing"
     kill -9 "$pid" 2>/dev/null || true
     # SIGKILL skips the daemon's cleanup, and that cleanup is what stops the server it
     # supervises, so the force-killed daemon leaves the proxy holding the port.

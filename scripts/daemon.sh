@@ -9,11 +9,15 @@
 #   - re-execs itself when this script changes, adopting the live server
 #
 # Build-triggered restarts wait for the hub to go idle first; crash restarts and an explicit
-# daemon-stop do not. Upstream's shutdown closes connections
-# immediately - api.Server.Stop calls http.Server.Close, "without graceful draining" -
-# so stopping the process mid-request drops it. The wait reads the in-flight gauge from
-# overlay/inflight; on a build older than that route, or with a management key the server
-# rejects, the wait skips itself.
+# daemon-stop do not. The wait reads the in-flight gauge from overlay/inflight; on a build
+# older than that route, or with a management key the server rejects, the wait skips itself.
+#
+# There are two layers of protection, deliberately. The gate keeps a restart from *starting*
+# while the hub is busy. The server additionally drains what is still in flight after SIGTERM
+# when `server.shutdown-timeout` is set - upstream added that in v8.0.77; before it, Stop
+# called http.Server.Close under "without graceful draining" and in-flight requests died.
+# STOP_GRACE below must stay above that drain budget, or this daemon force-kills mid-drain and
+# undoes both layers.
 #
 # Upstream has no build tiers to fall through, so unlike t3's daemon this one does
 # not give up: it stays up retrying the last binary it has, and picks up a fixed
@@ -49,6 +53,10 @@ HEALTH_TIMEOUT="${CLIPROXYAPI_HEALTH_TIMEOUT:-60}"
 # How long a restart waits for in-flight requests to finish. A streaming turn runs for
 # minutes, so the default is generous; an explicit `mise run daemon-stop` is not gated.
 IDLE_WAIT_TIMEOUT="${CLIPROXYAPI_IDLE_TIMEOUT:-1800}"
+# How long the server gets to exit after SIGTERM before it is force-killed. It spends that
+# window draining in-flight requests (server.shutdown-timeout), so this stays above the drain
+# budget: 150s = the 120s we configure plus margin.
+STOP_GRACE="${CLIPROXYAPI_STOP_GRACE:-150}"
 # Consecutive failed restarts of the current build before the daemon steps aside and
 # serves the fallback build instead (see the crash-recovery branch in the main loop).
 FALLBACK_AFTER_CRASHES="${CLIPROXYAPI_FALLBACK_AFTER_CRASHES:-2}"
@@ -157,13 +165,14 @@ stop_server() {
 		fi
 		log "Stopping server (PID $server_pid)..."
 		kill "$server_pid" 2>/dev/null || true
-		local i=0
-		while kill -0 "$server_pid" 2>/dev/null && [[ $i -lt 60 ]]; do
+		# Long enough for the server's own drain (server.shutdown-timeout) to finish first.
+		local i=0 limit=$((STOP_GRACE * 4))
+		while kill -0 "$server_pid" 2>/dev/null && [[ $i -lt $limit ]]; do
 			sleep 0.25
 			i=$((i + 1))
 		done
 		if kill -0 "$server_pid" 2>/dev/null; then
-			log "Force killing server (PID $server_pid)"
+			log "Server still running after ${STOP_GRACE}s - force killing (PID $server_pid)"
 			kill -9 "$server_pid" 2>/dev/null || true
 			wait "$server_pid" 2>/dev/null || true
 		fi
