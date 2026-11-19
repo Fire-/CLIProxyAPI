@@ -378,3 +378,10 @@ A second flake in the same package, same category: `TestOAuthCallbackRouteSkipsM
 passes under `-count=1` but fails the second time it runs inside one process, and the websocket
 test above fails with it, so `go test -count=2 ./internal/api/` is red on the untouched tag as
 well. The tasks run `-count=1`, which is the mode to trust.
+
+One more, and this one is deterministic on the v8.0.78 base rather than intermittent:
+`TestModelsWithClientVersionReturnsCodexCatalog` (in `internal/api`) fails with "expected gpt-5.5
+priority service tier, got []interface {}{}" - the catalog it builds has no `service_tiers` entry
+for that model, which looks like upstream's fixture and registry drifting apart. It fails the
+same way on the clean v8.0.78 tag (checked in a worktree of the tag), so it is not ours; the
+suite there is 104 packages ok and this one failure.
